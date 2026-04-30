@@ -1,0 +1,32 @@
+[package]
+name = "mc-motd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Lightweight async Minecraft MOTD query library"
+readme = "README.md"
+repository = "https://github.com/BE-Community-Dev/mc-motd"
+homepage = "https://github.com/BE-Community-Dev/mc-motd"
+documentation = "https://docs.rs/mc-motd"
+keywords = ["minecraft", "motd", "ping", "bedrock", "java"]
+categories = ["asynchronous", "network-programming", "parser-implementations"]
+exclude = [".github/", "Cargo.lock", "target/"]
+
+[lib]
+name = "mc_motd"
+path = "src/lib.rs"
+
+[dependencies]
+hickory-resolver = { version = "0.25.2", default-features = true }
+tokio = { version = "1.48.0", features = ["io-util", "net", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt", "time"] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
