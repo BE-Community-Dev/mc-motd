@@ -104,6 +104,13 @@ All notable changes to this project will be documented in this file.
     a stalled TLS handshake cannot make the fallback unreachable; a failed
     fallback is reported through `Error::Fallback { primary, fallback }`
     instead of discarding the more specific HTTP status
+  - NetherNet fetch errors carry their phase: a failure after response headers
+    (bad status, oversized body, or a body read error/timeout) is definitive
+    and never downgrades to plain HTTP, while only pre-response failures may
+    switch schemes
+  - `query_url` records the effective port of the scheme that answered
+    (443/80 for URLs without an explicit port, including after a fallback)
+    instead of always reporting the Bedrock default
   - Java status packets grow from a bounded initial capacity as bytes arrive
     instead of allocating the remote-declared length up front; a direct DNS
     failure keeps the SRV diagnostics collected before it

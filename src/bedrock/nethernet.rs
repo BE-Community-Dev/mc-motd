@@ -40,6 +40,40 @@ const BODY_RESERVE_HINT: usize = 4 * 1024;
 /// Process-wide shared HTTP client used by the default [`crate::Client`].
 static SHARED_HTTP: OnceLock<std::result::Result<reqwest::Client, String>> = OnceLock::new();
 
+/// Phase in which a join fetch failed.
+///
+/// The scheme fallback is only valid before the server produced any response:
+/// once response headers arrive, a body read failure is a definitive answer,
+/// not a connection problem.
+enum FetchError {
+    /// No response headers arrived: connect, TLS, or a pre-response timeout.
+    BeforeResponse(Error),
+    /// Response headers arrived; the failure must not trigger a fallback.
+    AfterResponse(Error),
+}
+
+impl FetchError {
+    fn into_error(self) -> Error {
+        match self {
+            Self::BeforeResponse(error) | Self::AfterResponse(error) => error,
+        }
+    }
+}
+
+/// The join endpoint that answered.
+struct JoinOutcome {
+    details: codec::NetherNetDetails,
+    used_https: bool,
+    /// Effective port of the URL that answered, including scheme defaults.
+    port: u16,
+}
+
+/// Effective port of an HTTP(S) URL, falling back to the Bedrock default.
+fn effective_port(url: &reqwest::Url) -> u16 {
+    url.port_or_known_default()
+        .unwrap_or(crate::DEFAULT_BEDROCK_PORT)
+}
+
 /// Build the shared HTTP client used for `NetherNet` queries.
 ///
 /// The client uses rustls with the webpki root store, a 5 second connect
@@ -95,9 +129,14 @@ pub async fn query_with(address: impl AsRef<str>, options: QueryOptions) -> Resu
 /// Query a `NetherNet` join endpoint URL directly.
 ///
 /// Accepts `https://` and `http://` URLs. An `https://` URL falls back to the
-/// same host and port over plain `http://` when the TLS attempt fails at the
-/// transport level and the insecure-HTTP policy allows it. Receiving any HTTP
-/// status, including non-`2xx`, never triggers the fallback.
+/// same host and port over plain `http://` when the TLS attempt fails before
+/// the server produces any response and the insecure-HTTP policy allows it.
+/// Receiving any response — including a non-`2xx` status or a body read
+/// failure — never triggers the fallback.
+///
+/// `Status.address` records the endpoint that answered: the URL host and the
+/// effective port of the scheme actually used (443 or 80 when the URL has no
+/// explicit port, including after a scheme fallback).
 ///
 /// # Errors
 ///
@@ -113,19 +152,17 @@ pub async fn query_url(url: &str, options: QueryOptions) -> Result<Status> {
         .checked_add(resolved.timeout)
         .ok_or(Error::InvalidInput("query timeout is too large"))?;
     let http = shared_http()?;
-    let used_https;
-    let mut details = match parsed.scheme() {
-        "https" => {
-            let (details, scheme) = probe_join(http, &parsed, deadline, &resolved, true).await?;
-            used_https = scheme;
-            details
-        }
+    let outcome = match parsed.scheme() {
+        "https" => probe_join(http, &parsed, deadline, &resolved, true).await?,
         "http" => {
-            used_https = false;
-            let body = fetch_join(http, &parsed, deadline, resolved.max_response_bytes).await?;
-            let mut details = codec::parse_join_slice(&body)?;
-            details.insecure_http = true;
-            details
+            let body = fetch_join(http, &parsed, deadline, resolved.max_response_bytes)
+                .await
+                .map_err(FetchError::into_error)?;
+            JoinOutcome {
+                details: codec::parse_join_slice(&body)?,
+                used_https: false,
+                port: effective_port(&parsed),
+            }
         }
         _ => {
             return Err(Error::InvalidInput(
@@ -134,7 +171,11 @@ pub async fn query_url(url: &str, options: QueryOptions) -> Result<Status> {
         }
     };
     let elapsed = started.elapsed();
-    let port = parsed.port().unwrap_or(crate::DEFAULT_BEDROCK_PORT);
+    let JoinOutcome {
+        mut details,
+        used_https,
+        port,
+    } = outcome;
     // Plain HTTP answers are marked on the details so the derived transport
     // reports the insecure scheme.
     details.insecure_http = !used_https;
@@ -142,7 +183,9 @@ pub async fn query_url(url: &str, options: QueryOptions) -> Result<Status> {
         ServerAddress {
             host: parsed.host_str().unwrap_or_default().to_string(),
             // The join endpoint is Bedrock-only; both port fields carry the
-            // endpoint port so the struct keeps its non-zero invariant.
+            // endpoint port so the struct keeps its non-zero invariant. The
+            // recorded port is the one that actually answered, including a
+            // scheme default (443/80) and a scheme fallback.
             java_port: port,
             bedrock_port: port,
             explicit_port: parsed.port(),
@@ -187,9 +230,9 @@ pub(crate) async fn probe(
 
     let used_https;
     let details = match probe_join(&parts.http, &url, deadline, resolved, prefer_https).await {
-        Ok((details, scheme)) => {
-            used_https = scheme;
-            details
+        Ok(outcome) => {
+            used_https = outcome.used_https;
+            outcome.details
         }
         Err(error) => {
             return Err(Attempt {
@@ -224,7 +267,7 @@ async fn probe_join(
     deadline: Instant,
     resolved: &ResolvedOptions,
     prefer_https: bool,
-) -> Result<(codec::NetherNetDetails, bool), Error> {
+) -> Result<JoinOutcome, Error> {
     let first_is_https = prefer_https;
     // A scheme fallback is possible when the primary is HTTPS and the policy
     // allows plain HTTP, or when the primary is HTTP (switching to HTTPS is
@@ -244,25 +287,30 @@ async fn probe_join(
 
     let first_result = fetch_join(http, url, first_deadline, resolved.max_response_bytes).await;
     match first_result {
-        Ok(body) => Ok((codec::parse_join_slice(&body)?, first_is_https)),
-        Err(first_error) => {
-            // Only switch schemes when the first attempt failed before the
-            // server produced any response: transport errors and timeouts. A
-            // server that answers (any status, or a rejected body) is treated
-            // as a definitive answer about its `NetherNet` support.
-            let received_response =
-                matches!(first_error, Error::HttpStatus(_) | Error::InvalidPacket(_));
-            if received_response {
-                return Err(first_error);
-            }
+        Ok(body) => Ok(JoinOutcome {
+            details: codec::parse_join_slice(&body)?,
+            used_https: first_is_https,
+            port: effective_port(url),
+        }),
+        // The server answered before the failure: a bad status, an oversized
+        // body, or a body read error is definitive and must not downgrade the
+        // scheme. The error already carries the phase information.
+        Err(FetchError::AfterResponse(error)) => Err(error),
+        Err(FetchError::BeforeResponse(first_error)) => {
+            // Only a pre-response failure may switch schemes.
             if !fallback_possible {
                 return Err(first_error);
             }
             let other_url = switch_scheme(url)?;
             let other_is_https = !first_is_https;
+            let other_port = effective_port(&other_url);
             match fetch_join(http, &other_url, deadline, resolved.max_response_bytes).await {
                 Ok(body) => match codec::parse_join_slice(&body) {
-                    Ok(details) => Ok((details, other_is_https)),
+                    Ok(details) => Ok(JoinOutcome {
+                        details,
+                        used_https: other_is_https,
+                        port: other_port,
+                    }),
                     Err(parse_error) => Err(Error::Fallback {
                         primary: Box::new(first_error),
                         fallback: Box::new(parse_error),
@@ -272,7 +320,7 @@ async fn probe_join(
                 // transport error is often the more specific diagnosis.
                 Err(fallback_error) => Err(Error::Fallback {
                     primary: Box::new(first_error),
-                    fallback: Box::new(fallback_error),
+                    fallback: Box::new(fallback_error.into_error()),
                 }),
             }
         }
@@ -299,26 +347,31 @@ async fn fetch_join(
     url: &reqwest::Url,
     deadline: Instant,
     max_response_bytes: usize,
-) -> Result<Vec<u8>, Error> {
+) -> Result<Vec<u8>, FetchError> {
+    let timeout = crate::client::engine::remaining(deadline).map_err(FetchError::BeforeResponse)?;
     let mut response = http
         .get(url.clone())
-        .timeout(crate::client::engine::remaining(deadline)?)
+        .timeout(timeout)
         .send()
         .await
-        .map_err(|error| map_transport_error(&error))?;
+        .map_err(|error| FetchError::BeforeResponse(map_transport_error(&error)))?;
 
+    // From here on the server has produced response headers: every failure is
+    // a definitive answer and must not trigger a scheme fallback.
     let status = response.status();
     if !status.is_success() {
-        return Err(Error::HttpStatus(status.as_u16()));
+        return Err(FetchError::AfterResponse(Error::HttpStatus(
+            status.as_u16(),
+        )));
     }
 
     if response
         .content_length()
         .is_some_and(|length| length > max_response_bytes as u64)
     {
-        return Err(Error::InvalidPacket(
+        return Err(FetchError::AfterResponse(Error::InvalidPacket(
             "NetherNet response body exceeds the size limit",
-        ));
+        )));
     }
 
     // Reserve a bounded amount up front: a validated Content-Length is a
@@ -334,12 +387,12 @@ async fn fetch_join(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| map_transport_error(&error))?
+        .map_err(|error| FetchError::AfterResponse(map_transport_error(&error)))?
     {
         if body.len() + chunk.len() > max_response_bytes {
-            return Err(Error::InvalidPacket(
+            return Err(FetchError::AfterResponse(Error::InvalidPacket(
                 "NetherNet response body exceeds the size limit",
-            ));
+            )));
         }
         body.extend_from_slice(&chunk);
     }
@@ -370,6 +423,8 @@ mod tests {
     use super::*;
 
     use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -517,6 +572,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn body_read_failure_after_headers_does_not_fall_back() {
+        // The server sends 200 headers with a body length it never completes.
+        // Response headers arrived, so the failure is definitive: the scheme
+        // must not be downgraded to plain HTTP.
+        let (address, connections) = spawn_stalling_body_mock().await;
+        let url = reqwest::Url::parse(&format!("http://{address}/v1/join"))
+            .expect("mock URL should parse");
+        let http = build_http_client().expect("test HTTP client should build");
+        let resolved = QueryOptions::default()
+            .allow_insecure_http(true)
+            .timeout(Duration::from_secs(1))
+            .resolve_over(&QueryOptions::default());
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let error = probe_join(&http, &url, deadline, &resolved, false)
+            .await
+            .err()
+            .expect("the incomplete body must fail");
+
+        assert!(
+            matches!(error, Error::Timeout),
+            "a body-read timeout should surface directly, got {error:?}"
+        );
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "a failure after response headers must not attempt a scheme fallback"
+        );
+    }
+
+    #[test]
+    fn url_effective_ports_include_scheme_defaults() {
+        let https = reqwest::Url::parse("https://example.com/v1/join").expect("valid URL");
+        let http = reqwest::Url::parse("http://example.com/v1/join").expect("valid URL");
+        let explicit = reqwest::Url::parse("https://example.com:19132/v1/join").expect("valid URL");
+
+        assert_eq!(effective_port(&https), 443);
+        assert_eq!(effective_port(&http), 80);
+        assert_eq!(effective_port(&explicit), 19_132);
+    }
+
+    #[tokio::test]
     #[ignore = "queries public Minecraft servers; run with --ignored"]
     async fn live_nethernet_servers_respond() {
         // Public servers fluctuate; require at least one of them to answer
@@ -595,6 +692,38 @@ mod tests {
             }
         });
         address
+    }
+
+    /// Spawn a mock that sends response headers with an incomplete body and
+    /// then keeps the connection open, counting accepted connections.
+    async fn spawn_stalling_body_mock() -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("mock listener should bind");
+        let address = listener.local_addr().expect("mock address should exist");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&connections);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 512];
+                    let _ = stream.read(&mut buffer).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{",
+                        )
+                        .await;
+                    // Keep the connection open: the declared body never
+                    // completes, so the client hits its body-read timeout.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                });
+            }
+        });
+        (address, connections)
     }
 
     /// Spawn a mock that stalls TLS handshakes and answers plain HTTP requests
