@@ -7,6 +7,10 @@ use tokio::time;
 
 use crate::MotdError;
 
+/// NetherNet join endpoint queries for Bedrock Edition 1.26.51+.
+#[cfg(feature = "nethernet")]
+pub mod nethernet;
+
 const RAKNET_MAGIC: [u8; 16] = [
     0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78,
 ];
@@ -121,6 +125,38 @@ pub async fn query_bedrock_addr(
     address: SocketAddr,
     timeout: Duration,
 ) -> Result<BedrockMotd, MotdError> {
+    // Heap buffer: the owned result allocates anyway, and keeping the pong
+    // buffer out of this future keeps composed auto-probe futures small.
+    let mut buffer = vec![0_u8; 2048];
+    let motd = query_bedrock_addr_into(address, &mut buffer, timeout).await?;
+    Ok(motd.to_owned())
+}
+
+/// Query a Bedrock Edition server at an already resolved socket address,
+/// reading the pong packet into a caller-provided buffer.
+///
+/// This is the zero-allocation path: the call itself allocates nothing on the
+/// heap, and the returned [`BedrockMotdRef`] borrows the parsed fields from
+/// `buffer`. Reuse one buffer across repeated polls to keep steady-state
+/// allocations at zero. `buffer` must hold at least 35 bytes
+/// (`PONG_HEADER_LEN`); 2048 bytes covers every known MOTD, and a truncated
+/// pong fails parsing with [`MotdError::InvalidPacket`].
+///
+/// # Errors
+///
+/// Returns [`MotdError::InvalidInput`] if `buffer` is too small for a pong
+/// header, [`MotdError`] for socket creation, send, and receive failures or
+/// timeouts, and [`MotdError::InvalidPacket`] for invalid or truncated pongs.
+pub async fn query_bedrock_addr_into(
+    address: SocketAddr,
+    buffer: &mut [u8],
+    timeout: Duration,
+) -> Result<BedrockMotdRef<'_>, MotdError> {
+    if buffer.len() < PONG_HEADER_LEN {
+        return Err(MotdError::InvalidInput(
+            "pong buffer must hold at least 35 bytes",
+        ));
+    }
     let bind_address = if address.is_ipv4() {
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
     } else {
@@ -133,12 +169,11 @@ pub async fn query_bedrock_addr(
     write_ping_packet(&mut packet);
     socket.send(&packet).await?;
 
-    let mut buffer = [0_u8; 2048];
-    let len = time::timeout(timeout, socket.recv(&mut buffer))
+    let len = time::timeout(timeout, socket.recv(&mut buffer[..]))
         .await
         .map_err(|_| MotdError::Timeout)??;
 
-    parse_bedrock_pong(&buffer[..len]).map(|motd| motd.to_owned())
+    parse_bedrock_pong(&buffer[..len])
 }
 
 /// Build a Bedrock `RakNet` unconnected ping packet.
@@ -369,6 +404,39 @@ mod tests {
         assert_eq!(motd.edition, "MCPE");
         assert_eq!(motd.motd_line_1, "Server");
         server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn query_bedrock_addr_into_parses_borrowed_pong() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("mock socket should bind");
+        let address = socket.local_addr().expect("mock address should exist");
+        let server = tokio::spawn(async move {
+            respond_with_pong(socket).await;
+        });
+
+        let mut buffer = [0_u8; 2048];
+        let motd = query_bedrock_addr_into(address, &mut buffer, Duration::from_millis(500))
+            .await
+            .expect("mock pong should parse");
+
+        assert_eq!(motd.edition, "MCPE");
+        assert_eq!(motd.motd_line_1, "Server");
+        assert_eq!(motd.players_max, Some(8));
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn query_bedrock_addr_into_rejects_small_buffer() {
+        let mut buffer = [0_u8; 16];
+        let address: SocketAddr = "127.0.0.1:19132".parse().expect("address should parse");
+
+        let error = query_bedrock_addr_into(address, &mut buffer, Duration::from_millis(100))
+            .await
+            .expect_err("small buffer should fail");
+
+        assert!(matches!(error, MotdError::InvalidInput(_)));
     }
 
     #[tokio::test]

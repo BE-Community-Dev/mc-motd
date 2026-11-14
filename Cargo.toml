@@ -1,6 +1,6 @@
 [package]
 name = "mc-motd"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -17,12 +17,26 @@ exclude = [".github/", "Cargo.lock", "target/"]
 name = "mc_motd"
 path = "src/lib.rs"
 
+[features]
+default = ["nethernet", "java"]
+nethernet = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+java = ["dep:hickory-resolver"]
+
 [dependencies]
-hickory-resolver = { version = "0.25.2", default-features = true }
-tokio = { version = "1.48.0", features = ["io-util", "net", "time"] }
+hickory-resolver = { version = "0.25.2", default-features = false, features = ["system-config", "tokio"], optional = true }
+socket2 = { version = "0.6", default-features = false }
+tokio = { version = "1.48.0", default-features = false, features = ["io-util", "macros", "net", "sync", "time"] }
+
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+serde_json = { version = "1", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt", "time"] }
+tokio = { version = "1.48.0", default-features = false, features = ["io-util", "macros", "net", "rt", "time"] }
+
+[[example]]
+name = "query"
+required-features = ["java"]
 
 [lints.rust]
 unsafe_code = "warn"
