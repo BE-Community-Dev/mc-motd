@@ -22,6 +22,8 @@ All notable changes to this project will be documented in this file.
 - Structured error model: `Error` with `Attempt { transport, target, error }`
   entries preserving the original error chain, plus
   `NoCompatibleServer` / `NoCompatibleJavaServer` / `NoCompatibleBedrockServer`.
+  `Error::Fallback { primary, fallback }` keeps both failures when a transport
+  attempt and its scheme fallback fail.
 - Concurrent automatic probing: Java and Bedrock probes are polled in parallel
   with a single shared DNS resolution, the first compatible response wins, and
   inside the Bedrock race the faster transport wins (`NetherNet` preferred on
@@ -97,6 +99,17 @@ All notable changes to this project will be documented in this file.
   - Java SRV budgets reserve one share for the direct fallback, so a silent
     SRV target can no longer consume the whole deadline and starve the
     documented direct probe
+  - NetherNet reserves part of the deadline for the optional plain-HTTP
+    fallback when the primary attempt is HTTPS with insecure HTTP allowed, so
+    a stalled TLS handshake cannot make the fallback unreachable; a failed
+    fallback is reported through `Error::Fallback { primary, fallback }`
+    instead of discarding the more specific HTTP status
+  - Java status packets grow from a bounded initial capacity as bytes arrive
+    instead of allocating the remote-declared length up front; a direct DNS
+    failure keeps the SRV diagnostics collected before it
+  - the process-wide default client caches its original `Error` (a resolver
+    setup failure stays `Error::Dns`) and documents that the first
+    initialization result is permanent for the process
   - Java description flattening appends every array element and `extra` child
     into one output buffer; aggregate error formatting writes directly into the
     formatter instead of building a `Vec<String>`

@@ -18,6 +18,13 @@ use crate::error::{Attempt, Error, Result};
 use crate::protocol::java as codec;
 use crate::status::{Details, JavaDetails, Players, Status, Transport, Version};
 
+/// Initial capacity for a Java status packet buffer.
+///
+/// The length prefix is a remote claim; a server that declares a large packet
+/// and then stalls must not force that much memory to be allocated up front.
+/// The buffer starts small and grows as bytes actually arrive.
+const PACKET_RESERVE_HINT: usize = 8 * 1024;
+
 /// Java Edition SRV lookup target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -294,17 +301,24 @@ pub(crate) async fn run(
         }
     }
 
-    let ips = crate::client::engine::resolve_probe_ips(&address.host, deadline)
-        .await
-        .map_err(|error| Error::NoCompatibleJavaServer {
-            host: address.host.clone(),
-            java_port: address.java_port,
-            attempts: vec![Attempt {
+    let ips = match crate::client::engine::resolve_probe_ips(&address.host, deadline).await {
+        Ok(ips) => ips,
+        Err(error) => {
+            // Keep the SRV diagnostics collected above: a direct-resolution
+            // failure must not erase what the SRV phase already learned.
+            let mut all = std::mem::take(&mut prefix_attempts);
+            all.push(Attempt {
                 transport: Transport::JavaTcp,
                 target: address.host.clone(),
                 error: Box::new(error),
-            }],
-        })?;
+            });
+            return Err(Error::NoCompatibleJavaServer {
+                host: address.host.clone(),
+                java_port: address.java_port,
+                attempts: all,
+            });
+        }
+    };
 
     probe_direct(address, &ips, resolved, deadline)
         .await
@@ -510,13 +524,22 @@ async fn query_socket(
         return Err(Error::InvalidPacket("Java status packet is too large"));
     }
 
-    let mut packet = vec![0_u8; packet_len];
-    time::timeout(
-        crate::client::engine::remaining(deadline)?,
-        stream.read_exact(&mut packet),
-    )
-    .await
-    .map_err(|_| Error::Timeout)??;
+    // Grow the buffer as bytes actually arrive instead of trusting the
+    // declared length: a server can claim a large packet and then stall, and
+    // the declaration must not turn into an up-front allocation.
+    let mut packet = Vec::with_capacity(packet_len.min(PACKET_RESERVE_HINT));
+    {
+        let mut limited = (&mut stream).take(u64::try_from(packet_len).unwrap_or(u64::MAX));
+        time::timeout(
+            crate::client::engine::remaining(deadline)?,
+            limited.read_to_end(&mut packet),
+        )
+        .await
+        .map_err(|_| Error::Timeout)??;
+    }
+    if packet.len() != packet_len {
+        return Err(Error::InvalidPacket("Java status packet is truncated"));
+    }
 
     let raw_json = codec::parse_status_response(&packet)?.to_owned();
     // A well-formed status packet carrying garbage is a protocol failure, not

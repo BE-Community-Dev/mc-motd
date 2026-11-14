@@ -22,6 +22,12 @@ use crate::status::{BedrockDetails, Details, Status, Transport};
 
 const JOIN_PATH: &str = "/v1/join";
 const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Time held back from the primary attempt for the optional scheme fallback.
+///
+/// A server that accepts the TCP connection but stalls the TLS handshake would
+/// otherwise consume the whole query deadline, leaving the plain-HTTP fallback
+/// no time even when the caller allowed it.
+const SCHEME_FALLBACK_RESERVE: Duration = Duration::from_millis(750);
 /// Default response body cap for `NetherNet` join responses (64 KiB).
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// Upper bound for the initial body reservation.
@@ -219,8 +225,24 @@ async fn probe_join(
     resolved: &ResolvedOptions,
     prefer_https: bool,
 ) -> Result<(codec::NetherNetDetails, bool), Error> {
-    let first_result = fetch_join(http, url, deadline, resolved.max_response_bytes).await;
     let first_is_https = prefer_https;
+    // A scheme fallback is possible when the primary is HTTPS and the policy
+    // allows plain HTTP, or when the primary is HTTP (switching to HTTPS is
+    // always allowed). Reserve part of the deadline for it up front: a stalled
+    // TLS handshake must not starve the fallback.
+    let fallback_possible = !first_is_https || resolved.allow_insecure_http;
+    let first_deadline = if fallback_possible {
+        let remaining = crate::client::engine::remaining(deadline)?;
+        // Keep the primary attempt at least half of the remaining time, but
+        // never reserve more than the fixed slice.
+        let reserve = SCHEME_FALLBACK_RESERVE.min(remaining / 2);
+        let first_budget = remaining.checked_sub(reserve).unwrap_or_default();
+        Instant::now().checked_add(first_budget).unwrap_or(deadline)
+    } else {
+        deadline
+    };
+
+    let first_result = fetch_join(http, url, first_deadline, resolved.max_response_bytes).await;
     match first_result {
         Ok(body) => Ok((codec::parse_join_slice(&body)?, first_is_https)),
         Err(first_error) => {
@@ -233,23 +255,25 @@ async fn probe_join(
             if received_response {
                 return Err(first_error);
             }
-            let insecure_allowed = if first_is_https {
-                resolved.allow_insecure_http
-            } else {
-                // Plain HTTP failed; switching to HTTPS is always allowed
-                // because it is the stronger scheme.
-                true
-            };
-            if !insecure_allowed {
+            if !fallback_possible {
                 return Err(first_error);
             }
             let other_url = switch_scheme(url)?;
+            let other_is_https = !first_is_https;
             match fetch_join(http, &other_url, deadline, resolved.max_response_bytes).await {
-                Ok(body) => {
-                    let other_is_https = !first_is_https;
-                    Ok((codec::parse_join_slice(&body)?, other_is_https))
-                }
-                Err(_) => Err(first_error),
+                Ok(body) => match codec::parse_join_slice(&body) {
+                    Ok(details) => Ok((details, other_is_https)),
+                    Err(parse_error) => Err(Error::Fallback {
+                        primary: Box::new(first_error),
+                        fallback: Box::new(parse_error),
+                    }),
+                },
+                // Preserve both failures: the fallback's HTTP status or
+                // transport error is often the more specific diagnosis.
+                Err(fallback_error) => Err(Error::Fallback {
+                    primary: Box::new(first_error),
+                    fallback: Box::new(fallback_error),
+                }),
             }
         }
     }
@@ -441,6 +465,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn silent_tls_still_leaves_time_for_the_http_fallback() {
+        // The server accepts TCP but never finishes the TLS handshake. The
+        // primary attempt must not consume the whole deadline: the reserved
+        // slice lets the plain-HTTP fallback answer.
+        let address = spawn_tls_stalling_mock("HTTP/1.1 200 OK", HIVE_JOIN_JSON).await;
+        let options = QueryOptions::default()
+            .allow_insecure_http(true)
+            .timeout(Duration::from_millis(600));
+        let started = Instant::now();
+
+        let status = query_with(format!("127.0.0.1:{}", address.port()), options)
+            .await
+            .expect("the HTTP fallback should answer after a stalled TLS handshake");
+
+        assert_eq!(status.motd, "HIVE-O-WEEN | BEDWARS S5");
+        assert_eq!(status.transport(), Transport::NetherNetHttp);
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "the whole query must stay inside its deadline, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_failure_keeps_both_attempt_errors() {
+        // The TLS attempt times out and the HTTP fallback returns 404. The
+        // more specific fallback answer must not be discarded.
+        let address = spawn_tls_stalling_mock("HTTP/1.1 404 Not Found", "nope").await;
+        let options = QueryOptions::default()
+            .allow_insecure_http(true)
+            .timeout(Duration::from_millis(600));
+
+        let error = query_with(format!("127.0.0.1:{}", address.port()), options)
+            .await
+            .expect_err("both attempts must fail");
+
+        match error {
+            Error::Fallback { primary, fallback } => {
+                assert!(
+                    matches!(primary.as_ref(), Error::Timeout),
+                    "the primary TLS attempt should time out, got {primary:?}"
+                );
+                assert!(
+                    matches!(fallback.as_ref(), Error::HttpStatus(404)),
+                    "the fallback's HTTP status must be preserved, got {fallback:?}"
+                );
+            }
+            other => panic!("expected a fallback error pair, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "queries public Minecraft servers; run with --ignored"]
     async fn live_nethernet_servers_respond() {
         // Public servers fluctuate; require at least one of them to answer
@@ -516,6 +592,52 @@ mod tests {
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.flush().await;
+            }
+        });
+        address
+    }
+
+    /// Spawn a mock that stalls TLS handshakes and answers plain HTTP requests
+    /// with the given status line and body.
+    async fn spawn_tls_stalling_mock(status_line: &'static str, body: &'static str) -> SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("mock listener should bind");
+        let address = listener.local_addr().expect("mock address should exist");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 512];
+                    let Ok(len) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if len == 0 {
+                        return;
+                    }
+                    if !buffer[..len].starts_with(b"GET") {
+                        // TLS ClientHello: hold the connection open without
+                        // answering, so the primary attempt runs into its
+                        // share of the deadline.
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        return;
+                    }
+                    let mut request = Vec::from(&buffer[..len]);
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut buffer).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => request.extend_from_slice(&buffer[..read]),
+                        }
+                    }
+                    let response = format!(
+                        "{status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
             }
         });
         address

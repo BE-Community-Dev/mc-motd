@@ -751,13 +751,21 @@ fn build_srv_resolver() -> Result<SrvResolver, crate::error::Error> {
     Ok(())
 }
 
-static DEFAULT_CLIENT: OnceLock<std::result::Result<Client, String>> = OnceLock::new();
+static DEFAULT_CLIENT: OnceLock<std::result::Result<Client, Error>> = OnceLock::new();
 
+/// Return the process-wide default client.
+///
+/// The first initialization result — success or failure — is cached for the
+/// process lifetime, and the original [`Error`] classification is preserved
+/// (a resolver setup failure stays [`Error::Dns`], not [`Error::Http`]).
+/// A failure is therefore permanent for the default client; callers that need
+/// to recover from a transient initialization problem should build their own
+/// [`Client`] with [`Client::builder`].
 pub(crate) fn default_client() -> std::result::Result<&'static Client, crate::error::Error> {
     DEFAULT_CLIENT
-        .get_or_init(|| Client::builder().build().map_err(|error| error.to_string()))
+        .get_or_init(|| Client::builder().build())
         .as_ref()
-        .map_err(|message| crate::error::Error::Http(message.clone()))
+        .map_err(Error::clone)
 }
 
 /// Handle to the client's SRV resolver: the hickory resolver when the

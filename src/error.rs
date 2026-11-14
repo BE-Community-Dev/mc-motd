@@ -34,6 +34,16 @@ pub enum Error {
     HttpStatus(u16),
     /// An HTTP request failed before or during the exchange.
     Http(String),
+    /// A primary transport attempt and its scheme fallback both failed.
+    ///
+    /// Keeping both failures means a TLS error cannot hide the fallback's more
+    /// specific answer (for example an HTTP status code).
+    Fallback {
+        /// Failure of the primary attempt.
+        primary: Box<Error>,
+        /// Failure of the fallback attempt.
+        fallback: Box<Error>,
+    },
     /// Automatic Java and Bedrock probing both failed.
     NoCompatibleServer {
         /// Original normalized host.
@@ -94,6 +104,10 @@ impl Clone for Error {
             Self::InvalidUtf8(error) => Self::InvalidUtf8(*error),
             Self::HttpStatus(status) => Self::HttpStatus(*status),
             Self::Http(message) => Self::Http(message.clone()),
+            Self::Fallback { primary, fallback } => Self::Fallback {
+                primary: primary.clone(),
+                fallback: fallback.clone(),
+            },
             Self::NoCompatibleServer {
                 host,
                 java_port,
@@ -153,6 +167,12 @@ impl fmt::Display for Error {
                 write!(formatter, "server returned HTTP status {status}")
             }
             Self::Http(error) => write!(formatter, "HTTP request failed: {error}"),
+            Self::Fallback { primary, fallback } => {
+                write!(
+                    formatter,
+                    "primary attempt failed: {primary}; fallback failed: {fallback}"
+                )
+            }
             Self::NoCompatibleServer {
                 host,
                 java_port,
@@ -217,6 +237,9 @@ impl std::error::Error for Error {
             | Self::NoCompatibleBedrockServer { attempts, .. } => attempts
                 .first()
                 .map(|attempt| attempt.error.as_ref() as &(dyn std::error::Error + 'static)),
+            // A scheme-fallback pair chains to the primary failure; the
+            // fallback error stays reachable through the `Fallback` variant.
+            Self::Fallback { primary, .. } => Some(primary.as_ref()),
             Self::ResolveFailed
             | Self::Timeout
             | Self::Dns(_)
