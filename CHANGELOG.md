@@ -86,12 +86,17 @@ All notable changes to this project will be documented in this file.
     `Unavailable`) instead of inspecting error message text
   - a `FlightGuard` is armed before the first admission await and captured by
     the detached probe task, so cancellation during admission, abort, panic, or
-    runtime shutdown all remove the flight and publish an error; its message
-    is neutral because `Drop` cannot distinguish those cases
+    runtime shutdown all remove the flight; a pending owner that disappears
+    marks the flight abandoned and its waiters retry under their own deadlines
+    (one takes over the key), while an admitted probe that dies publishes an
+    error instead of restarting a possibly panicking probe
   - `max_queued(n)` bounds admitted merged probes separately from
     `max_in_flight`; the pending flight is inserted before waiting for a queue
     slot, so a saturated queue still merges same-key callers into one probe
     instead of re-probing per released slot
+  - Java SRV budgets reserve one share for the direct fallback, so a silent
+    SRV target can no longer consume the whole deadline and starve the
+    documented direct probe
   - Java description flattening appends every array element and `extra` child
     into one output buffer; aggregate error formatting writes directly into the
     formatter instead of building a `Vec<String>`

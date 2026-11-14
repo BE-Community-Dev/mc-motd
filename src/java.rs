@@ -327,16 +327,18 @@ pub(crate) async fn probe_srv_sequence(
     deadline: Instant,
 ) -> Result<Status, Vec<Attempt>> {
     let mut attempts = Vec::new();
-    // Fair-share the remaining deadline across SRV targets so one silent
-    // target cannot consume the budget meant for the rest.
-    let mut targets_left = targets.len();
+    // Fair-share the remaining deadline across the SRV targets *and* the
+    // direct fallback, which runs after them. Without reserving a share, a
+    // silent last target consumes the whole deadline and the documented
+    // fallback never gets a chance to run.
+    let mut stages_left = targets.len() + 1;
     for target in targets {
         let remaining = crate::client::engine::remaining(deadline).unwrap_or_default();
-        let target_budget = remaining / u32::try_from(targets_left).unwrap_or(u32::MAX);
+        let target_budget = remaining / u32::try_from(stages_left).unwrap_or(u32::MAX);
         let target_deadline = Instant::now()
             .checked_add(target_budget)
             .unwrap_or(deadline);
-        targets_left = targets_left.saturating_sub(1);
+        stages_left = stages_left.saturating_sub(1);
 
         match probe_target(address, target, resolved, target_deadline).await {
             Ok(status) => return Ok(status),
@@ -918,5 +920,95 @@ mod tests {
         assert_eq!(status.motd, "Mock");
         assert_eq!(status.players.online, Some(1));
         assert_eq!(status.version.protocol, Some(763));
+    }
+
+    #[tokio::test]
+    async fn srv_timeouts_leave_time_for_the_direct_fallback() {
+        // One silent SRV target and a direct address that answers. The target
+        // must not consume the whole deadline: the direct fallback is part of
+        // the budget split.
+        let silent = spawn_silent_server().await;
+        let direct = spawn_status_server().await;
+        let address = crate::address::parse_server_address(
+            &format!("127.0.0.1:{}", direct.port()),
+            25_565,
+            19_132,
+        )
+        .expect("address should parse");
+        let targets = vec![SrvTarget {
+            host: "127.0.0.1".into(),
+            port: silent.port(),
+            priority: 0,
+            weight: 0,
+        }];
+        let resolved = ResolvedOptions {
+            edition: None,
+            java_port: address.java_port,
+            bedrock_port: address.bedrock_port,
+            timeout: Duration::from_millis(800),
+            try_srv: true,
+            allow_insecure_http: false,
+            max_response_bytes: 64 * 1024,
+            max_java_status_bytes: crate::client::DEFAULT_MAX_JAVA_STATUS_BYTES,
+        };
+        let deadline = Instant::now() + Duration::from_millis(800);
+
+        let status = probe_srv_sequence(&address, &targets, &resolved, deadline)
+            .await
+            .expect("the direct fallback should still answer");
+
+        assert_eq!(status.motd, "Mock");
+        assert!(
+            matches!(&status.details, Details::Java(details) if details.srv.is_none()),
+            "the answer must come from the direct fallback"
+        );
+    }
+
+    /// Spawn a Java status server that answers every connection with a valid
+    /// status payload.
+    async fn spawn_status_server() -> std::net::SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("mock listener should bind");
+        let address = listener.local_addr().expect("mock address should exist");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 256];
+                    let _ = stream.read(&mut request).await;
+
+                    let json = r#"{"description":"Mock","players":{"online":1,"max":20},"version":{"name":"1.21.4","protocol":763}}"#;
+                    let body = json.as_bytes();
+                    let mut packet = vec![0x00];
+                    packet.push(u8::try_from(body.len()).expect("length fits in u8"));
+                    packet.extend_from_slice(body);
+                    let mut frame = vec![u8::try_from(packet.len()).expect("length fits in u8")];
+                    frame.extend_from_slice(&packet);
+                    let _ = stream.write_all(&frame).await;
+                });
+            }
+        });
+        address
+    }
+
+    /// Spawn a TCP server that accepts one connection and never answers, so
+    /// the client's status read runs into its deadline.
+    async fn spawn_silent_server() -> std::net::SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("silent listener should bind");
+        let address = listener.local_addr().expect("mock address should exist");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0_u8; 256];
+            let _ = stream.read(&mut request).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        address
     }
 }

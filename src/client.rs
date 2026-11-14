@@ -575,6 +575,10 @@ impl ClientBuilder {
     /// would make repeated queries restart the same work. The detached task is
     /// always bounded by its absolute deadline.
     ///
+    /// A pending owner that is cancelled or runs out of time *before*
+    /// admission does not fail its waiters: the key is handed to them and they
+    /// retry under their own deadlines, one of them taking over.
+    ///
     /// Use [`ClientBuilder::max_queued`] to bound how many shared probes may be
     /// admitted at once.
     ///
@@ -620,8 +624,11 @@ impl ClientBuilder {
     /// Callers for the same key share one pending flight while it waits for a
     /// slot, so a saturated queue does not break merging: the first caller
     /// owns the pending flight and the rest wait on its outcome. Flights that
-    /// have not been admitted yet are lightweight map entries; bounding the
-    /// number of caller tasks remains the caller's responsibility.
+    /// have not been admitted yet are lightweight map entries created by, and
+    /// removed with, their owning caller task; their number is therefore
+    /// bounded by the caller's live tasks, and a separate pending-key limit
+    /// would duplicate caller-side backpressure while breaking same-key
+    /// merging whenever that limit is saturated.
     ///
     /// This is separate from [`ClientBuilder::max_in_flight`]: the queue bound
     /// limits how many probes may exist, the in-flight bound limits how many
@@ -760,17 +767,29 @@ pub(crate) type SrvResolver = hickory_resolver::TokioResolver;
 #[cfg(not(feature = "java"))]
 pub(crate) type SrvResolver = ();
 
+/// Terminal or in-progress state published by a flight's `watch` channel.
+#[derive(Clone)]
+enum FlightState {
+    /// The owner is still waiting for admission, or the probe is running.
+    Pending,
+    /// The shared probe finished with this outcome.
+    Done(Arc<Result<Status, Error>>),
+    /// The pending owner disappeared before admission. Waiters may retry under
+    /// their own deadlines instead of inheriting the owner's failure.
+    Abandoned,
+}
+
 /// One merged in-flight probe shared by concurrent identical callers.
 pub(crate) struct Flight {
-    /// Broadcasts the shared outcome. A `watch` channel retains the latest
+    /// Broadcasts the shared state. A `watch` channel retains the latest
     /// value, so a caller that subscribes after the probe finished still sees
     /// the result instead of waiting for a notification that already fired.
-    outcome: tokio::sync::watch::Sender<Option<Arc<Result<Status, Error>>>>,
+    outcome: tokio::sync::watch::Sender<FlightState>,
 }
 
 impl Flight {
     fn new() -> Self {
-        let (outcome, _receiver) = tokio::sync::watch::channel(None);
+        let (outcome, _receiver) = tokio::sync::watch::channel(FlightState::Pending);
         Self { outcome }
     }
 }
@@ -788,6 +807,14 @@ enum Admission {
     },
 }
 
+/// What a waiter observed.
+enum FlightOutcome {
+    /// The shared probe finished.
+    Done(Arc<Result<Status, Error>>),
+    /// The pending owner vanished before admission; try again.
+    Abandoned,
+}
+
 impl Client {
     /// Run a full query merged with concurrent identical callers.
     ///
@@ -802,6 +829,10 @@ impl Client {
     /// shared probe's absolute deadline was fixed earlier. Failures are shared
     /// too: a waiter never re-probes, so an unreachable server cannot turn one
     /// merged probe into a request storm.
+    ///
+    /// A *pending* owner that is cancelled or runs out of time before
+    /// admission does not fail its waiters: the flight is marked abandoned and
+    /// they retry under their own deadlines, one of them taking over the key.
     async fn merged_probe(
         &self,
         key: &str,
@@ -810,52 +841,56 @@ impl Client {
         address: &ServerAddress,
         resolved: &ResolvedOptions,
     ) -> Result<Status, Error> {
-        let admission = self.admit(key, deadline).await?;
-        let flight = match &admission {
-            Admission::Joined(flight) => Arc::clone(flight),
-            Admission::Created { entry, .. } => Arc::clone(entry),
-        };
+        loop {
+            let admission = self.admit(key, deadline).await?;
+            let flight = match &admission {
+                Admission::Joined(flight) => Arc::clone(flight),
+                Admission::Created { entry, .. } => Arc::clone(entry),
+            };
 
-        // Subscribe before reading the outcome: `watch` retains the latest
-        // value, so a result that lands between these two steps is still
-        // observed instead of being lost.
-        let mut outcome = flight.outcome.subscribe();
+            // Subscribe before reading the state: `watch` retains the latest
+            // value, so a result that lands between these two steps is still
+            // observed instead of being lost.
+            let mut outcome = flight.outcome.subscribe();
 
-        if let Admission::Created { permit, guard, .. } = admission {
-            // Creator: run the probe in a detached task so this caller's
-            // cancellation cannot abort it for the other waiters. The guard
-            // was armed before the admission wait and is captured by the task,
-            // so it cleans up even if the task is dropped before its first
-            // poll; the permit bounds how many probes may be admitted.
-            let parts = self.parts();
-            let address = address.clone();
-            let resolved = resolved.clone();
-            // `SrvResolver` is `()` without the `java` feature; cloning the
-            // unit placeholder is intentional and harmless in that build.
-            #[allow(clippy::let_unit_value, clippy::clone_on_copy)]
-            let srv_resolver = self.srv_resolver().clone();
-            tokio::spawn(async move {
-                let _queue_permit = permit;
-                let shared = Arc::new(
-                    engine::full_with_deadline(
-                        &parts,
-                        &address,
-                        &resolved,
-                        &srv_resolver,
-                        started,
-                        deadline,
-                    )
-                    .await,
-                );
-                guard.complete(shared);
-            });
-        }
+            if let Admission::Created { permit, guard, .. } = admission {
+                // Creator: run the probe in a detached task so this caller's
+                // cancellation cannot abort it for the other waiters. The
+                // guard was armed before the admission wait and is captured by
+                // the task, so it cleans up even if the task is dropped before
+                // its first poll; the permit bounds how many probes may be
+                // admitted.
+                let parts = self.parts();
+                let address = address.clone();
+                let resolved = resolved.clone();
+                // `SrvResolver` is `()` without the `java` feature; cloning the
+                // unit placeholder is intentional and harmless in that build.
+                #[allow(clippy::let_unit_value, clippy::clone_on_copy)]
+                let srv_resolver = self.srv_resolver().clone();
+                tokio::spawn(async move {
+                    let _queue_permit = permit;
+                    let shared = Arc::new(
+                        engine::full_with_deadline(
+                            &parts,
+                            &address,
+                            &resolved,
+                            &srv_resolver,
+                            started,
+                            deadline,
+                        )
+                        .await,
+                    );
+                    guard.complete(shared);
+                });
+            }
 
-        match wait_for_flight(&mut outcome, deadline).await? {
-            Some(shared) => settle(shared.as_ref(), started),
-            None => Err(Error::Io(Arc::new(std::io::Error::other(
-                "shared query task ended without a result",
-            )))),
+            match wait_for_flight(&mut outcome, deadline).await? {
+                FlightOutcome::Done(shared) => return settle(shared.as_ref(), started),
+                // The pending owner disappeared before admission. Retry with
+                // our own remaining deadline; another waiter may already have
+                // taken over the key.
+                FlightOutcome::Abandoned => {}
+            }
         }
     }
 
@@ -865,8 +900,8 @@ impl Client {
     /// concurrent callers for the same key share it even while the queue is
     /// saturated. The creating caller owns the pending flight until it is
     /// admitted; a guard is armed before the first await so cancellation or a
-    /// panic during admission removes the placeholder and publishes the real
-    /// failure instead of leaving an unowned flight behind.
+    /// panic during admission removes the placeholder. Waiters are told the
+    /// flight was abandoned rather than inheriting this caller's failure.
     async fn admit(&self, key: &str, deadline: Instant) -> Result<Admission, Error> {
         let entry = {
             let mut flights = self.inner.flights.lock().expect("flights lock poisoned");
@@ -878,7 +913,7 @@ impl Client {
             entry
         };
 
-        let guard = FlightGuard::new(
+        let mut guard = FlightGuard::new(
             Arc::clone(&self.inner.flights),
             key.to_string(),
             Arc::clone(&entry),
@@ -886,12 +921,14 @@ impl Client {
         let permit = match acquire_queue_slot(&self.inner.queued, deadline).await {
             Ok(permit) => permit,
             Err(error) => {
-                // Share the real failure with anyone who joined the pending
-                // flight, then remove it.
-                guard.complete(Arc::new(Err(error.clone())));
+                // This owner cannot be admitted in time, but its waiters may
+                // still have budget left: hand the key over instead of
+                // publishing this caller's deadline as their result.
+                guard.abandon();
                 return Err(error);
             }
         };
+        guard.mark_admitted();
         Ok(Admission::Created {
             entry,
             permit,
@@ -925,13 +962,16 @@ async fn acquire_queue_slot(
 ///
 /// The guard is armed before the first await of the admission path and then
 /// moved into the detached probe task, so cancellation during admission, a
-/// panic, an abort, or a runtime shutdown all remove the map entry and publish
-/// a failure. The normal path calls [`FlightGuard::complete`], which disarms
-/// the guard.
+/// panic, an abort, or a runtime shutdown all remove the map entry.
+///
+/// A flight that was still waiting for admission is marked
+/// [`FlightState::Abandoned`] so waiters can retry; an admitted flight
+/// publishes an error because its probe died after it started.
 struct FlightGuard {
     flights: Arc<Mutex<HashMap<String, Arc<Flight>>>>,
     key: String,
     entry: Arc<Flight>,
+    admitted: bool,
     armed: bool,
 }
 
@@ -945,15 +985,30 @@ impl FlightGuard {
             flights,
             key,
             entry,
+            admitted: false,
             armed: true,
         }
     }
 
+    /// Record that the flight was admitted and its probe task now owns it.
+    fn mark_admitted(&mut self) {
+        self.admitted = true;
+    }
+
     /// Publish the outcome, remove the flight, and disarm the cleanup path.
-    fn complete(mut self, shared: Arc<Result<Status, Error>>) {
+    fn complete(self, shared: Arc<Result<Status, Error>>) {
+        self.finish(FlightState::Done(shared));
+    }
+
+    /// Hand the key to the remaining waiters instead of publishing a failure.
+    fn abandon(self) {
+        self.finish(FlightState::Abandoned);
+    }
+
+    fn finish(mut self, state: FlightState) {
         self.armed = false;
         remove_flight_if_current(&self.flights, &self.key, &self.entry);
-        self.entry.outcome.send_replace(Some(shared));
+        self.entry.outcome.send_replace(state);
     }
 }
 
@@ -971,34 +1026,40 @@ impl Drop for FlightGuard {
         {
             flights.remove(&self.key);
         }
-        self.entry
-            .outcome
-            .send_replace(Some(Arc::new(Err(Error::Io(Arc::new(
-                // `Drop` cannot tell a panic from an abort or a runtime
-                // shutdown, so the message stays neutral.
-                std::io::Error::other("shared query ended without publishing a result"),
-            ))))));
+        let state = if self.admitted {
+            // The probe task died after it started; `Drop` cannot tell a panic
+            // from an abort or a runtime shutdown, so the message stays neutral.
+            FlightState::Done(Arc::new(Err(Error::Io(Arc::new(std::io::Error::other(
+                "shared query ended without publishing a result",
+            ))))))
+        } else {
+            // Nothing ran yet: let the waiters retry under their own deadlines.
+            FlightState::Abandoned
+        };
+        self.entry.outcome.send_replace(state);
     }
 }
 
-/// Wait for the shared outcome, bounded by this caller's deadline.
+/// Wait for a flight to reach a terminal state, bounded by this caller's
+/// deadline.
 ///
-/// Returns `Ok(None)` when the shared task disappeared without publishing an
-/// outcome (runtime shutdown or a panic).
+/// A dropped sender is treated as an abandoned flight so waiters can retry.
 async fn wait_for_flight(
-    outcome: &mut tokio::sync::watch::Receiver<Option<Arc<Result<Status, Error>>>>,
+    outcome: &mut tokio::sync::watch::Receiver<FlightState>,
     deadline: Instant,
-) -> Result<Option<Arc<Result<Status, Error>>>, Error> {
+) -> Result<FlightOutcome, Error> {
     loop {
-        // Re-check the retained value before every wait: this is what makes
-        // an outcome that landed before the wait started impossible to miss.
-        let shared = { outcome.borrow_and_update().clone() };
-        if shared.is_some() {
-            return Ok(shared);
+        // Re-check the retained state before every wait: this is what makes a
+        // result that landed before the wait started impossible to miss.
+        let state = { outcome.borrow_and_update().clone() };
+        match state {
+            FlightState::Pending => {}
+            FlightState::Done(shared) => return Ok(FlightOutcome::Done(shared)),
+            FlightState::Abandoned => return Ok(FlightOutcome::Abandoned),
         }
         match time::timeout(engine::remaining(deadline)?, outcome.changed()).await {
             Ok(Ok(())) => {}
-            Ok(Err(_)) => return Ok(None),
+            Ok(Err(_)) => return Ok(FlightOutcome::Abandoned),
             Err(_) => return Err(Error::Timeout),
         }
     }
@@ -2315,6 +2376,95 @@ mod concurrency_tests {
         );
     }
 
+    #[tokio::test]
+    async fn cancelled_pending_owner_hands_the_key_to_waiters() {
+        // A holds the only queue slot. B becomes the pending owner for a
+        // second key and other callers join it. Aborting B must not fail
+        // them: they retry under their own deadlines and one takes over.
+        let mock = spawn_mock(MOCK_MOTD_TEXT, Duration::from_millis(100), true).await;
+        let address = format!("{}:{}", mock.address.ip(), mock.address.port());
+        let client = Client::builder()
+            .merge_in_flight(true)
+            .max_queued(1)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("test client should build");
+
+        let holder = {
+            let client = client.clone();
+            let address = address.clone();
+            tokio::spawn(async move {
+                client
+                    .query_with(address, QueryOptions::default().edition(Edition::Bedrock))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let owner = {
+            let client = client.clone();
+            let address = address.clone();
+            let options = QueryOptions::default()
+                .edition(Edition::Bedrock)
+                .max_response_bytes(4096);
+            tokio::spawn(async move { client.query_with(address, options).await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut waiters = Vec::new();
+        for _ in 0..5 {
+            let client = client.clone();
+            let address = address.clone();
+            let options = QueryOptions::default()
+                .edition(Edition::Bedrock)
+                .max_response_bytes(4096);
+            waiters.push(tokio::spawn(async move {
+                client.query_with(address, options).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // The holder's flight and the pending owner's flight exist, so the
+        // waiters below have joined a real pending flight.
+        assert_eq!(
+            client
+                .inner
+                .flights
+                .lock()
+                .expect("flights lock poisoned")
+                .len(),
+            2,
+            "the pending owner should have registered its flight"
+        );
+
+        owner.abort();
+        assert!(
+            owner
+                .await
+                .expect_err("the owner should be cancelled")
+                .is_cancelled(),
+            "the task should report cancellation"
+        );
+
+        for waiter in waiters {
+            let status = waiter
+                .await
+                .expect("waiter task should finish")
+                .expect("waiters must not inherit the owner's cancellation");
+            assert_eq!(status.motd, "RakNet Mock");
+        }
+        holder
+            .await
+            .expect("holder task should finish")
+            .expect("holder query should answer");
+
+        assert_eq!(
+            mock.pings.load(Ordering::SeqCst),
+            2,
+            "one probe for the holder and one for the taken-over key"
+        );
+    }
+
     #[test]
     fn max_queued_rejects_zero() {
         let error = Client::builder()
@@ -2352,12 +2502,44 @@ mod concurrency_tests {
             flights.lock().expect("flights lock poisoned").is_empty(),
             "a panicking shared task must remove its flight"
         );
-        let published = outcome.borrow_and_update().clone();
-        let published = published.expect("a panic must publish an error outcome");
+        let published = { outcome.borrow_and_update().clone() };
         assert!(
-            matches!(published.as_ref(), Err(Error::Io(_))),
-            "the published outcome should be an I/O error"
+            matches!(published, FlightState::Abandoned),
+            "a pending owner that panics must abandon the flight so waiters retry"
         );
+    }
+
+    #[test]
+    fn admitted_task_panic_publishes_an_error() {
+        // Once a probe has been admitted, an abnormal exit is a real failure:
+        // waiters must not retry the key behind a possibly panicking probe.
+        let flights = Arc::new(Mutex::new(HashMap::new()));
+        let entry = Arc::new(Flight::new());
+        flights
+            .lock()
+            .expect("flights lock poisoned")
+            .insert("admitted-key".to_string(), Arc::clone(&entry));
+        let mut outcome = entry.outcome.subscribe();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let flights = Arc::clone(&flights);
+            let entry = Arc::clone(&entry);
+            move || {
+                let mut guard = FlightGuard::new(flights, "admitted-key".to_string(), entry);
+                guard.mark_admitted();
+                panic!("simulated admitted-probe panic");
+            }
+        }));
+        assert!(result.is_err(), "the closure should have panicked");
+
+        let published = { outcome.borrow_and_update().clone() };
+        match published {
+            FlightState::Done(shared) => assert!(
+                matches!(shared.as_ref(), Err(Error::Io(_))),
+                "an admitted probe failure must publish an I/O error"
+            ),
+            _ => panic!("an admitted probe failure must publish a terminal outcome"),
+        }
     }
 
     #[cfg(feature = "nethernet")]
