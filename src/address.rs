@@ -315,3 +315,39 @@ mod tests {
         assert!(matches!(error, Error::InvalidInput(_)));
     }
 }
+
+#[cfg(test)]
+mod malformed_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_addresses_never_panic() {
+        for input in [
+            "",
+            ":",
+            "::",
+            "::1",
+            "[",
+            "[::1",
+            "[::1]:",
+            "[::1]:99999",
+            "host:",
+            "host:0",
+            "host:99999999999999",
+            ".",
+            "..",
+            "-host.example.com",
+            "host-.example.com",
+            "host..example.com",
+            "host example.com",
+            "host\u{0}.example.com",
+            "\u{7f}\u{80}",
+            "example.com.",
+            "255.255.255.255:19132",
+            "[::ffff:255.255.255.255]:19132",
+        ] {
+            let _ = parse_server_address(input, 25_565, 19_132);
+            let _ = normalize_server_host(input);
+        }
+    }
+}

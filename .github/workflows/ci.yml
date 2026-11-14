@@ -6,12 +6,13 @@ on:
 
 jobs:
   test:
-    name: Rust ${{ matrix.toolchain }}
-    runs-on: ubuntu-latest
+    name: Rust ${{ matrix.toolchain }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         toolchain: ["1.85.0", stable]
+        os: [ubuntu-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -51,3 +52,14 @@ jobs:
       - run: cargo check --all-targets ${{ matrix.features }}
       - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
       - run: cargo test ${{ matrix.features }}
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - run: cargo install cargo-audit --locked || cargo audit --version
+      - run: cargo audit

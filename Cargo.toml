@@ -49,7 +49,7 @@ name = "lan_discovery"
 required-features = ["lan"]
 
 [lints.rust]
-unsafe_code = "warn"
+unsafe_code = "forbid"
 
 [lints.clippy]
 all = "warn"

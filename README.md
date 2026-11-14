@@ -12,8 +12,8 @@ The public API is organized in three layers:
 
 1. **One-liner queries** — `mc_motd::query(address)` probes every compiled
    edition concurrently and returns the first compatible response.
-2. **Reusable clients** — `Client` shares DNS handling, the NetherNet
-   connection pool, and a bounded transport cache across queries.
+2. **Reusable clients** — `Client` shares the Java SRV resolver, the
+   NetherNet connection pool, and a bounded transport cache across queries.
 3. **Protocol codecs** — `mc_motd::protocol` exposes pure encode/decode helpers
    (no sockets, no caching), including zero-copy parsing paths.
 
@@ -124,8 +124,11 @@ Every successful query returns `Status`:
   both fail, the aggregate error keeps both probe failures.
 - The transport that answers is cached per `host:port` inside the calling
   `Client` (10 minute TTL, bounded capacity) so later queries skip the failing
-  probe. `client.cached_transport()` and `client.clear_transport_cache()`
-  expose it.
+  probe. A cache hit is waited on through a short grace window; if it has not
+  answered by then (a server switched transports), the other transport joins
+  the race as a parallel fallback. `client.cached_transport()` and
+  `client.clear_transport_cache()` expose the cache; the recorded transport
+  distinguishes `NetherNetHttps` from `NetherNetHttp`.
 - `timeout` is an end-to-end deadline: SRV lookup, DNS, and every probe share
   it instead of restarting it per stage.
 - Direct Java probes — and every RakNet transport path — try every resolved
@@ -138,9 +141,21 @@ Every successful query returns `Status`:
   inside each priority class; zero-weight records own an empty range and are
   only ordered once nothing else remains. An explicitly specified port skips
   SRV entirely.
-- A status response whose JSON cannot be parsed is a protocol failure
-  (`Error::InvalidPacket`), not a blank status; missing optional fields stay
-  lenient.
+- A status response whose JSON cannot be parsed — or is not a JSON object —
+  is a protocol failure (`Error::InvalidPacket`), not a blank status; missing
+  optional fields stay lenient. The JSON is parsed once per query.
+- SRV records pointing at `.` or port 0 mark the service decidedly
+  unavailable and surface as an attempt error instead of silently falling
+  back to direct probing.
+- `allow_insecure_http` defaults to **disabled**: plain-HTTP NetherNet answers
+  are unauthenticated, so the fallback must be enabled explicitly per client
+  builder or per query. `Transport::NetherNetHttp` on a status marks an
+  insecure-HTTP answer; `Transport::NetherNetHttps` marks a verified one.
+- LAN discovery dedupes replies per socket address (multiple servers on one
+  host are all reported), caps results (`max_results`, default 32), and
+  correlates pongs with the ping timestamp to ignore stale replies.
+- `unsafe_code` is forbidden crate-wide, and CI runs `cargo audit` plus a
+  Windows job alongside the Linux feature matrix.
 
 ## Protocol layer
 

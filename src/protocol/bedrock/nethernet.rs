@@ -49,6 +49,11 @@ pub struct NetherNetDetailsRef<'a> {
     pub transport_layer: Option<u32>,
     /// Connection id (`connection`), when reported.
     pub connection: Option<u32>,
+    /// Whether the response was fetched over plain HTTP.
+    ///
+    /// Parsing alone cannot know the scheme and defaults to `false`
+    /// (HTTPS); the network layer overrides it when plain HTTP answered.
+    pub insecure_http: bool,
 }
 
 impl NetherNetDetailsRef<'_> {
@@ -71,6 +76,7 @@ impl NetherNetDetailsRef<'_> {
             nonce: self.nonce.as_ref().map(Cow::to_string),
             transport_layer: self.transport_layer,
             connection: self.connection,
+            insecure_http: self.insecure_http,
         }
     }
 
@@ -159,6 +165,7 @@ fn validate_join_response(response: JoinResponseRef<'_>) -> Result<NetherNetDeta
         nonce: response.nonce,
         transport_layer: response.transport_layer,
         connection: response.connection,
+        insecure_http: false,
     })
 }
 
@@ -284,5 +291,28 @@ mod tests {
         assert_eq!(game_type_name(Some(2)), Some("Adventure"));
         assert_eq!(game_type_name(Some(7)), None);
         assert_eq!(game_type_name(None), None);
+    }
+
+    #[test]
+    fn malformed_inputs_never_panic() {
+        let base = r#"{"name":"Server","protocol":589,"players":1,"maxPlayers":10}"#;
+        for cut in 0..base.len() {
+            let _ = parse_join(&base[..cut]);
+        }
+        for text in [
+            "",
+            "{",
+            "[]",
+            "null",
+            "true",
+            "\"just a string\"",
+            "{\"name\":123}",
+            "{\"name\":null}",
+            "{\"name\":\"Server\",\"players\":-1}",
+            "{\"name\":\"Server\",\"maxPlayers\":1e300}",
+            "{\"name\":\"Server\",\"protocol\":\"589\"}",
+        ] {
+            let _ = parse_join(text);
+        }
     }
 }

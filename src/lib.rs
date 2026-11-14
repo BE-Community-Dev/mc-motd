@@ -28,19 +28,16 @@
 //!
 //! ```no_run
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! use mc_motd::{Details, query};
+//! use mc_motd::query;
 //!
 //! let status = query("play.example.com").await?;
 //!
 //! println!("transport={:?} elapsed={:?}", status.transport(), status.elapsed);
 //! println!("{}", status.motd);
 //! println!("{:?}", status.players);
-//! match &status.details {
-//!     Details::Java(details) => println!("{}", details.raw_json),
-//!     Details::Bedrock(bedrock) => println!("{bedrock:?}"),
-//!     // Non_exhaustive: future protocols fit without another breaking release.
-//!     _ => {}
-//! }
+//! // `Details` carries the protocol-specific payload; its variants depend on
+//! // the compiled feature set, so print it generically here.
+//! println!("{:?}", status.details);
 //! # Ok(())
 //! # }
 //! ```
@@ -98,7 +95,7 @@ use crate::client::default_client;
 /// Returns [`Error`] for invalid input, DNS failures, I/O failures, or when
 /// no compatible server answers.
 pub async fn query(address: impl AsRef<str>) -> Result<Status> {
-    default_client().query(address).await
+    default_client()?.query(address).await
 }
 
 /// Query a server address with explicit per-query options.
@@ -110,5 +107,5 @@ pub async fn query(address: impl AsRef<str>) -> Result<Status> {
 ///
 /// Returns [`Error`] under the same conditions as [`query`].
 pub async fn query_with(address: impl AsRef<str>, options: QueryOptions) -> Result<Status> {
-    default_client().query_with(address, options).await
+    default_client()?.query_with(address, options).await
 }

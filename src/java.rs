@@ -13,7 +13,7 @@ use tokio::net::TcpStream;
 use tokio::time;
 
 use crate::address::{self, ServerAddress};
-use crate::client::QueryOptions;
+use crate::client::{QueryOptions, ResolvedOptions};
 use crate::error::{Attempt, Error, Result};
 use crate::protocol::java as codec;
 use crate::status::{Details, JavaDetails, Players, Status, Transport, Version};
@@ -43,7 +43,7 @@ pub struct SrvTarget {
 /// Returns [`Error`] if the address is invalid, DNS lookup fails, the network
 /// exchange fails or exceeds the deadline, or no Java server answers.
 pub async fn query(address: impl AsRef<str>) -> Result<Status> {
-    crate::client::default_client().java(address).await
+    crate::client::default_client()?.java(address).await
 }
 
 /// Query a Java Edition server address with explicit options.
@@ -55,7 +55,7 @@ pub async fn query(address: impl AsRef<str>) -> Result<Status> {
 ///
 /// Returns [`Error`] under the same conditions as [`query`].
 pub async fn query_with(address: impl AsRef<str>, options: QueryOptions) -> Result<Status> {
-    crate::client::default_client()
+    crate::client::default_client()?
         .java_with(address, options)
         .await
 }
@@ -72,14 +72,22 @@ pub async fn query_with(address: impl AsRef<str>, options: QueryOptions) -> Resu
 /// if the lookup exceeds `timeout`, or [`Error::Dns`] if resolver setup or
 /// lookup fails.
 pub async fn resolve_srv(host: impl AsRef<str>, timeout: Duration) -> Result<Vec<SrvTarget>> {
+    let resolver = crate::client::default_client()?.srv_resolver().clone();
+    resolve_srv_with(&resolver, host, timeout).await
+}
+
+/// Resolve SRV records with a caller-supplied resolver so client queries
+/// reuse one resolver per client instead of rebuilding it per query.
+pub(crate) async fn resolve_srv_with(
+    resolver: &hickory_resolver::TokioResolver,
+    host: impl AsRef<str>,
+    timeout: Duration,
+) -> Result<Vec<SrvTarget>> {
     let host = address::normalize_server_host(host.as_ref())?;
     if !address::can_query_srv(host.as_ref()) {
         return Ok(Vec::new());
     }
 
-    let resolver = hickory_resolver::Resolver::builder_tokio()
-        .map_err(|error| Error::Dns(error.to_string()))?
-        .build();
     let name = address::minecraft_srv_name(host.as_ref());
     let lookup = time::timeout(timeout, resolver.srv_lookup(name))
         .await
@@ -94,9 +102,25 @@ pub async fn resolve_srv(host: impl AsRef<str>, timeout: Duration) -> Result<Vec
             priority: srv.priority(),
             weight: srv.weight(),
         })
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+    // RFC 2782: a "." target or port 0 means the service is decidedly
+    // unavailable — that is an authoritative answer, not a fallback signal.
+    if records
+        .iter()
+        .all(|target| target.host.is_empty() || target.port == 0)
+    {
+        return Err(Error::Dns(
+            "SRV records mark the service as unavailable".into(),
+        ));
+    }
+    let usable = records
+        .into_iter()
         .filter(|target| !target.host.is_empty() && target.port != 0)
         .collect::<Vec<_>>();
-    Ok(weighted_srv_order(records))
+    Ok(weighted_srv_order(usable))
 }
 
 /// Order SRV records by priority with RFC 2782 weighted-random selection
@@ -159,25 +183,26 @@ fn weighted_srv_order(mut records: Vec<SrvTarget>) -> Vec<SrvTarget> {
 ///
 /// SRV applies only when the caller let the library choose the port (no
 /// explicit port), the option is enabled, and the host is a DNS name.
-fn srv_applicable(address: &ServerAddress, options: &QueryOptions) -> bool {
-    options.try_srv && address.explicit_port.is_none() && address::can_query_srv(&address.host)
+fn srv_applicable(address: &ServerAddress, resolved: &ResolvedOptions) -> bool {
+    resolved.try_srv && address.explicit_port.is_none() && address::can_query_srv(&address.host)
 }
 
 /// Full Java path used by the engine: SRV records first, then direct.
 pub(crate) async fn run(
     address: &ServerAddress,
-    options: &QueryOptions,
+    resolved: &ResolvedOptions,
     deadline: Instant,
+    srv_resolver: &hickory_resolver::TokioResolver,
 ) -> Result<Status> {
     let mut prefix_attempts: Vec<Attempt> = Vec::new();
 
-    if srv_applicable(address, options) {
+    if srv_applicable(address, resolved) {
         // Cap the SRV budget so a slow SRV path cannot starve direct probes.
         let srv_budget =
             crate::client::engine::remaining(deadline)?.min(crate::client::SRV_LOOKUP_BUDGET);
-        match resolve_srv(&address.host, srv_budget).await {
+        match resolve_srv_with(srv_resolver, &address.host, srv_budget).await {
             Ok(targets) if !targets.is_empty() => {
-                return probe_srv_sequence(address, &targets, deadline)
+                return probe_srv_sequence(address, &targets, resolved, deadline)
                     .await
                     .map_err(|attempts| Error::NoCompatibleJavaServer {
                         host: address.host.clone(),
@@ -210,7 +235,7 @@ pub(crate) async fn run(
             }],
         })?;
 
-    probe_direct(address, &ips, deadline)
+    probe_direct(address, &ips, resolved, deadline)
         .await
         .map_err(|mut attempts| {
             let mut all = std::mem::take(&mut prefix_attempts);
@@ -227,11 +252,12 @@ pub(crate) async fn run(
 pub(crate) async fn probe_srv_sequence(
     address: &ServerAddress,
     targets: &[SrvTarget],
+    resolved: &ResolvedOptions,
     deadline: Instant,
 ) -> Result<Status, Vec<Attempt>> {
     let mut attempts = Vec::new();
     for target in targets {
-        match probe_target(address, target, deadline).await {
+        match probe_target(address, target, resolved, deadline).await {
             Ok(status) => return Ok(status),
             Err(error) => attempts.push(Attempt {
                 transport: Transport::JavaTcp,
@@ -242,7 +268,7 @@ pub(crate) async fn probe_srv_sequence(
     }
     // Direct fallback: an empty address list makes probe_direct resolve
     // the input host itself.
-    match probe_direct(address, &[], deadline).await {
+    match probe_direct(address, &[], resolved, deadline).await {
         Ok(status) => Ok(status),
         Err(mut direct_attempts) => {
             attempts.append(&mut direct_attempts);
@@ -257,13 +283,23 @@ pub(crate) async fn probe_srv_sequence(
 async fn probe_target(
     requested: &ServerAddress,
     target: &SrvTarget,
+    resolved: &ResolvedOptions,
     deadline: Instant,
 ) -> Result<Status, Error> {
     let ips = crate::client::engine::resolve_probe_ips(&target.host, deadline).await?;
     let mut last = None;
     for ip in ips {
         let socket = SocketAddr::new(ip, target.port);
-        match query_socket(socket, &target.host, target.port, requested, deadline).await {
+        match query_socket(
+            socket,
+            &target.host,
+            target.port,
+            requested,
+            resolved,
+            deadline,
+        )
+        .await
+        {
             Ok(status) => return Ok(mark_srv(status, target)),
             Err(error) => last = Some(error),
         }
@@ -290,12 +326,13 @@ fn mark_srv(mut status: Status, target: &SrvTarget) -> Status {
 pub(crate) async fn probe_direct(
     address: &ServerAddress,
     ips: &[IpAddr],
+    resolved: &ResolvedOptions,
     deadline: Instant,
 ) -> Result<Status, Vec<Attempt>> {
     let mut attempts = Vec::new();
-    let resolved;
+    let resolved_ips;
     let candidate_ips: &[IpAddr] = if ips.is_empty() {
-        resolved = crate::client::engine::resolve_probe_ips(&address.host, deadline)
+        resolved_ips = crate::client::engine::resolve_probe_ips(&address.host, deadline)
             .await
             .map_err(|error| {
                 vec![Attempt {
@@ -304,14 +341,33 @@ pub(crate) async fn probe_direct(
                     error: Box::new(error),
                 }]
             })?;
-        &resolved
+        &resolved_ips
     } else {
         ips
     };
 
+    // Fair-share the shared deadline across the addresses so a silently
+    // dropping first address cannot starve the failover candidates.
+    let mut attempts_left = candidate_ips.len();
     for ip in candidate_ips {
+        let share = crate::client::engine::remaining(deadline).unwrap_or_default()
+            / u32::try_from(attempts_left).unwrap_or(u32::MAX);
+        let attempt_deadline = Instant::now()
+            .checked_add(share.max(crate::client::MIN_ATTEMPT_BUDGET))
+            .unwrap_or(deadline);
+        attempts_left = attempts_left.saturating_sub(1);
+
         let socket = SocketAddr::new(*ip, address.java_port);
-        match query_socket(socket, &address.host, address.java_port, address, deadline).await {
+        match query_socket(
+            socket,
+            &address.host,
+            address.java_port,
+            address,
+            resolved,
+            attempt_deadline,
+        )
+        .await
+        {
             Ok(status) => return Ok(status),
             Err(error) => attempts.push(Attempt {
                 transport: Transport::JavaTcp,
@@ -329,6 +385,7 @@ async fn query_socket(
     host: &str,
     port: u16,
     requested: &ServerAddress,
+    resolved: &ResolvedOptions,
     deadline: Instant,
 ) -> Result<Status, Error> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -356,7 +413,7 @@ async fn query_socket(
     .map_err(|_| Error::Timeout)??;
     let packet_len = usize::try_from(packet_len)
         .map_err(|_| Error::InvalidPacket("Java status packet length is negative"))?;
-    if packet_len > codec::MAX_STATUS_PACKET_LEN {
+    if packet_len > resolved.max_java_status_bytes {
         return Err(Error::InvalidPacket("Java status packet is too large"));
     }
 
@@ -371,59 +428,60 @@ async fn query_socket(
     let raw_json = codec::parse_status_response(&packet)?.to_owned();
     // A well-formed status packet carrying garbage is a protocol failure, not
     // a blank server: without this check automatic probing would stop at a
-    // broken Java response. Missing optional fields stay lenient.
-    serde_json::from_str::<serde_json::Value>(&raw_json)
-        .map_err(|_| Error::InvalidPacket("Java status JSON is not valid JSON"))?;
-    Ok(Status::from_details(
-        requested.clone(),
-        Details::Java(JavaDetails {
+    // broken Java response. One typed parse validates the structure and
+    // yields the normalized fields; missing optional fields stay lenient.
+    // A status object must be a JSON object: serde would otherwise accept
+    // sequences like `[]` as field-order tuples for this struct.
+    if !raw_json.trim_start().starts_with('{') {
+        return Err(Error::InvalidPacket(
+            "Java status JSON is not a valid status object",
+        ));
+    }
+    let parsed = serde_json::from_str::<JavaJson>(&raw_json)
+        .map_err(|_| Error::InvalidPacket("Java status JSON is not a valid status object"))?;
+    Ok(Status {
+        address: requested.clone(),
+        motd: describe(&parsed.description),
+        players: Players {
+            online: parsed.players.online,
+            max: parsed.players.max,
+        },
+        version: Version {
+            name: parsed.version.name,
+            protocol: parsed
+                .version
+                .protocol
+                .and_then(|protocol| i32::try_from(protocol).ok()),
+        },
+        elapsed: Duration::ZERO,
+        details: Details::Java(JavaDetails {
             raw_json,
             srv: None,
         }),
-    ))
+    })
 }
 
-/// Extract the normalized MOTD text, player counts, and version from the raw
-/// Java status JSON. Unparseable JSON yields empty defaults; the raw payload
-/// stays available in [`JavaDetails`].
-pub(crate) fn extract_java_fields(raw_json: &str) -> (String, Players, Version) {
-    #[derive(Deserialize)]
-    struct JavaJson {
-        #[serde(default)]
-        description: serde_json::Value,
-        #[serde(default)]
-        players: JavaPlayers,
-        #[serde(default)]
-        version: JavaVersion,
-    }
-    #[derive(Deserialize, Default)]
-    struct JavaPlayers {
-        online: Option<u32>,
-        max: Option<u32>,
-    }
-    #[derive(Deserialize, Default)]
-    struct JavaVersion {
-        name: Option<String>,
-        protocol: Option<i64>,
-    }
+/// Typed Java status JSON used for the single structural parse.
+#[derive(Deserialize)]
+pub(crate) struct JavaJson {
+    #[serde(default)]
+    pub(crate) description: serde_json::Value,
+    #[serde(default)]
+    pub(crate) players: JavaPlayers,
+    #[serde(default)]
+    pub(crate) version: JavaVersion,
+}
 
-    let Ok(parsed) = serde_json::from_str::<JavaJson>(raw_json) else {
-        return (String::new(), Players::default(), Version::default());
-    };
+#[derive(Deserialize, Default)]
+pub(crate) struct JavaPlayers {
+    pub(crate) online: Option<u32>,
+    pub(crate) max: Option<u32>,
+}
 
-    let motd = describe(&parsed.description);
-    let players = Players {
-        online: parsed.players.online,
-        max: parsed.players.max,
-    };
-    let version = Version {
-        name: parsed.version.name,
-        protocol: parsed
-            .version
-            .protocol
-            .and_then(|protocol| i32::try_from(protocol).ok()),
-    };
-    (motd, players, version)
+#[derive(Deserialize, Default)]
+pub(crate) struct JavaVersion {
+    pub(crate) name: Option<String>,
+    pub(crate) protocol: Option<i64>,
 }
 
 /// Flatten a Java description component into plain text.
@@ -470,25 +528,38 @@ mod tests {
 
     #[test]
     fn srv_rules() {
-        let options = QueryOptions::default();
+        let resolved = ResolvedOptions {
+            edition: None,
+            java_port: 25_565,
+            bedrock_port: 19_132,
+            timeout: crate::client::DEFAULT_TIMEOUT,
+            try_srv: true,
+            allow_insecure_http: false,
+            max_response_bytes: 64 * 1024,
+            max_java_status_bytes: crate::client::DEFAULT_MAX_JAVA_STATUS_BYTES,
+        };
         let mut address = crate::address::parse_server_address("play.example.com", 25_565, 19_132)
             .expect("address should parse");
-        assert!(srv_applicable(&address, &options));
+        assert!(srv_applicable(&address, &resolved));
 
         // An explicit port pins the endpoint: no SRV.
         address = crate::address::parse_server_address("play.example.com:25566", 25_565, 19_132)
             .expect("address should parse");
-        assert!(!srv_applicable(&address, &options));
+        assert!(!srv_applicable(&address, &resolved));
 
         // IP literals never have SRV records.
         address = crate::address::parse_server_address("127.0.0.1", 25_565, 19_132)
             .expect("address should parse");
-        assert!(!srv_applicable(&address, &options));
+        assert!(!srv_applicable(&address, &resolved));
 
         // The option can disable SRV entirely.
         address = crate::address::parse_server_address("play.example.com", 25_565, 19_132)
             .expect("address should parse");
-        assert!(!srv_applicable(&address, &options.try_srv(false)));
+        let disabled = ResolvedOptions {
+            try_srv: false,
+            ..resolved.clone()
+        };
+        assert!(!srv_applicable(&address, &disabled));
     }
 
     #[test]
@@ -535,7 +606,19 @@ mod tests {
     #[test]
     fn describe_flattens_nested_components() {
         let json = r#"{"description":{"text":"Hello ","extra":[{"text":"World"},{"translate":"key.menu"}]},"players":{"online":1,"max":20},"version":{"name":"1.21.4","protocol":763}}"#;
-        let (motd, players, version) = extract_java_fields(json);
+        let parsed = serde_json::from_str::<JavaJson>(json).expect("json should parse");
+        let motd = describe(&parsed.description);
+        let players = Players {
+            online: parsed.players.online,
+            max: parsed.players.max,
+        };
+        let version = Version {
+            name: parsed.version.name,
+            protocol: parsed
+                .version
+                .protocol
+                .and_then(|protocol| i32::try_from(protocol).ok()),
+        };
 
         assert_eq!(motd, "Hello Worldkey.menu");
         assert_eq!(players.online, Some(1));
@@ -577,12 +660,51 @@ mod tests {
         assert!(
             matches!(
                 attempts[0].error.as_ref(),
-                Error::InvalidPacket("Java status JSON is not valid JSON")
+                Error::InvalidPacket("Java status JSON is not a valid status object")
             ),
             "inner failure should be the invalid JSON, got {:?}",
             attempts[0].error
         );
         assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[tokio::test]
+    async fn structurally_invalid_json_fails_the_query() {
+        // `[]` is valid JSON but not a status object: it must fail rather
+        // than produce a blank status.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("mock listener should bind");
+        let address = listener.local_addr().expect("mock address should exist");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let mut request = [0_u8; 256];
+            let _ = stream.read(&mut request).await;
+
+            let body = b"[]";
+            let mut packet = vec![0x00];
+            packet.push(u8::try_from(body.len()).expect("length fits in u8"));
+            packet.extend_from_slice(body);
+            let mut frame = vec![u8::try_from(packet.len()).expect("length fits in u8")];
+            frame.extend_from_slice(&packet);
+            let _ = stream.write_all(&frame).await;
+        });
+
+        let error = query(format!("127.0.0.1:{}", address.port()))
+            .await
+            .expect_err("structural mismatch should fail the query");
+
+        let Error::NoCompatibleJavaServer { attempts, .. } = &error else {
+            panic!("expected a Java aggregate error, got {error:?}");
+        };
+        assert!(
+            matches!(
+                attempts[0].error.as_ref(),
+                Error::InvalidPacket("Java status JSON is not a valid status object")
+            ),
+            "inner failure should be the structural mismatch, got {:?}",
+            attempts[0].error
+        );
     }
 
     #[tokio::test]

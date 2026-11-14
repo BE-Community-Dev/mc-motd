@@ -46,6 +46,19 @@ All notable changes to this project will be documented in this file.
 - Feature matrix: `java`, `bedrock`, `nethernet` (default), `lan` (opt-in) so
   Bedrock-only builds drop Java, SRV, and the DNS resolver dependency, and
   RakNet-only builds drop HTTP/TLS entirely.
+- Security and scheduling hardening from review:
+  - `allow_insecure_http` defaults to **disabled**; the actual scheme used is
+    reported through `Transport::NetherNetHttps` / `Transport::NetherNetHttp`.
+  - Multi-address failover gives each candidate a fair share of the shared
+    deadline, and a cached transport hit is waited on through a short grace
+    window before the other transport joins the race in parallel.
+  - Java status JSON is parsed once into a typed structure that validates the
+    object shape; non-object JSON fails with `Error::InvalidPacket`.
+  - The Java SRV resolver is reused per `Client`; SRV records pointing at `.`
+    surface as an explicit "service unavailable" attempt.
+  - LAN discovery dedupes per socket address, caps results, and correlates
+    pongs with the ping timestamp; `unsafe_code` is forbidden crate-wide;
+    CI gained Windows, a feature matrix, and `cargo audit`.
 - Contract fixes from review: an explicitly specified port skips SRV entirely;
   `Status.address` keeps the requested address (including explicit ports)
   untouched while SRV targets surface through `JavaDetails::srv`; status

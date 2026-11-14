@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::address::ServerAddress;
-use crate::client::{Parts, QueryOptions};
+use crate::client::{Parts, QueryOptions, ResolvedOptions};
 use crate::error::{Attempt, Error, Result};
 use crate::protocol::bedrock::nethernet as codec;
 use crate::status::{BedrockDetails, Details, Status, Transport};
@@ -62,7 +62,7 @@ pub(crate) fn shared_http() -> &'static reqwest::Client {
 /// exceeds the deadline, the response exceeds the body size limit, the status
 /// is not `2xx`, or the JSON document cannot be parsed or validated.
 pub async fn query(address: impl AsRef<str>) -> Result<Status> {
-    crate::client::default_client().nethernet(address).await
+    crate::client::default_client()?.nethernet(address).await
 }
 
 /// Query a Bedrock Edition server address over `NetherNet` only with explicit
@@ -72,7 +72,7 @@ pub async fn query(address: impl AsRef<str>) -> Result<Status> {
 ///
 /// Returns [`Error`] under the same conditions as [`query`].
 pub async fn query_with(address: impl AsRef<str>, options: QueryOptions) -> Result<Status> {
-    crate::client::default_client()
+    crate::client::default_client()?
         .nethernet_with(address, options)
         .await
 }
@@ -92,25 +92,44 @@ pub async fn query_with(address: impl AsRef<str>, options: QueryOptions) -> Resu
 pub async fn query_url(url: &str, options: QueryOptions) -> Result<Status> {
     let parsed =
         reqwest::Url::parse(url).map_err(|_| Error::InvalidInput("NetherNet URL is invalid"))?;
+    let resolved = options.resolve_over(&crate::client::QueryOptions::default());
     let started = Instant::now();
-    let deadline = started + options.timeout;
+    let deadline = started
+        .checked_add(resolved.timeout)
+        .ok_or(Error::InvalidInput("query timeout is too large"))?;
     let http = shared_http();
-    let details = match parsed.scheme() {
-        "https" => probe_https(http, &parsed, deadline, &options).await,
-        "http" => {
-            let body = fetch_join(http, &parsed, deadline, options.max_response_bytes).await?;
-            codec::parse_join_slice(&body)
+    let used_https;
+    let mut details = match parsed.scheme() {
+        "https" => {
+            let (details, scheme) = probe_join(http, &parsed, deadline, &resolved, true).await?;
+            used_https = scheme;
+            details
         }
-        _ => Err(Error::InvalidInput(
-            "NetherNet URL scheme must be http or https",
-        )),
-    }?;
+        "http" => {
+            used_https = false;
+            let body = fetch_join(http, &parsed, deadline, resolved.max_response_bytes).await?;
+            let mut details = codec::parse_join_slice(&body)?;
+            details.insecure_http = true;
+            details
+        }
+        _ => {
+            return Err(Error::InvalidInput(
+                "NetherNet URL scheme must be http or https",
+            ));
+        }
+    };
     let elapsed = started.elapsed();
+    let port = parsed.port().unwrap_or(crate::DEFAULT_BEDROCK_PORT);
+    // Plain HTTP answers are marked on the details so the derived transport
+    // reports the insecure scheme.
+    details.insecure_http = !used_https;
     let mut status = Status::from_details(
         ServerAddress {
             host: parsed.host_str().unwrap_or_default().to_string(),
-            java_port: 0,
-            bedrock_port: parsed.port().unwrap_or(crate::DEFAULT_BEDROCK_PORT),
+            // The join endpoint is Bedrock-only; both port fields carry the
+            // endpoint port so the struct keeps its non-zero invariant.
+            java_port: port,
+            bedrock_port: port,
             explicit_port: parsed.port(),
         },
         Details::Bedrock(BedrockDetails::NetherNet(details)),
@@ -125,36 +144,58 @@ pub(crate) async fn probe(
     address: &ServerAddress,
     deadline: Instant,
     parts: &Parts<'_>,
-    options: &QueryOptions,
+    resolved: &ResolvedOptions,
+    prefer_https: bool,
 ) -> Result<Status, Attempt> {
     let port = address.bedrock_port;
     let target = format!("{}:{}", address.host, port);
+    let attempt_transport = if prefer_https {
+        Transport::NetherNetHttps
+    } else {
+        Transport::NetherNetHttp
+    };
 
-    let url = match build_join_url("https", &address.host, port) {
+    let url = match build_join_url(
+        if prefer_https { "https" } else { "http" },
+        &address.host,
+        port,
+    ) {
         Ok(url) => url,
         Err(error) => {
             return Err(Attempt {
-                transport: Transport::NetherNetHttp,
+                transport: attempt_transport,
                 target,
                 error: Box::new(error),
             });
         }
     };
 
-    let details = match probe_https(parts.http, &url, deadline, options).await {
-        Ok(details) => details,
+    let used_https;
+    let details = match probe_join(parts.http, &url, deadline, resolved, prefer_https).await {
+        Ok((details, scheme)) => {
+            used_https = scheme;
+            details
+        }
         Err(error) => {
             return Err(Attempt {
-                transport: Transport::NetherNetHttp,
+                transport: attempt_transport,
                 target,
                 error: Box::new(error),
             });
         }
     };
-    parts
-        .cache
-        .store(&address.host, port, Transport::NetherNetHttp);
+    parts.cache.store(
+        &address.host,
+        port,
+        if used_https {
+            Transport::NetherNetHttps
+        } else {
+            Transport::NetherNetHttp
+        },
+    );
 
+    let mut details = details;
+    details.insecure_http = !used_https;
     Ok(Status::from_details(
         address.clone(),
         Details::Bedrock(BedrockDetails::NetherNet(details)),
@@ -162,34 +203,61 @@ pub(crate) async fn probe(
 }
 
 /// Probe the HTTPS join endpoint with the documented plain-HTTP fallback.
-async fn probe_https(
+async fn probe_join(
     http: &reqwest::Client,
     url: &reqwest::Url,
     deadline: Instant,
-    options: &QueryOptions,
-) -> Result<codec::NetherNetDetails, Error> {
-    match fetch_join(http, url, deadline, options.max_response_bytes).await {
-        Ok(body) => codec::parse_join_slice(&body),
-        Err(https_error) => {
-            // Only fall back when the HTTPS attempt failed before the server
-            // produced any response: transport errors and timeouts. A server
-            // that answers (any status, or a rejected body) is treated as a
-            // definitive answer about its `NetherNet` support.
+    resolved: &ResolvedOptions,
+    prefer_https: bool,
+) -> Result<(codec::NetherNetDetails, bool), Error> {
+    let first_result = fetch_join(http, url, deadline, resolved.max_response_bytes).await;
+    let first_is_https = prefer_https;
+    match first_result {
+        Ok(body) => Ok((codec::parse_join_slice(&body)?, first_is_https)),
+        Err(first_error) => {
+            // Only switch schemes when the first attempt failed before the
+            // server produced any response: transport errors and timeouts. A
+            // server that answers (any status, or a rejected body) is treated
+            // as a definitive answer about its `NetherNet` support.
             let received_response =
-                matches!(https_error, Error::HttpStatus(_) | Error::InvalidPacket(_));
-            if received_response || !options.allow_insecure_http {
-                return Err(https_error);
+                matches!(first_error, Error::HttpStatus(_) | Error::InvalidPacket(_));
+            if received_response {
+                return Err(first_error);
             }
-            let mut http_url = url.clone();
-            if http_url.set_scheme("http").is_err() {
-                return Err(https_error);
+            let insecure_allowed = if first_is_https {
+                resolved.allow_insecure_http
+            } else {
+                // Plain HTTP failed; switching to HTTPS is always allowed
+                // because it is the stronger scheme.
+                true
+            };
+            if !insecure_allowed {
+                return Err(first_error);
             }
-            match fetch_join(http, &http_url, deadline, options.max_response_bytes).await {
-                Ok(body) => codec::parse_join_slice(&body),
-                Err(_) => Err(https_error),
+            let other_url = switch_scheme(url)?;
+            match fetch_join(http, &other_url, deadline, resolved.max_response_bytes).await {
+                Ok(body) => {
+                    let other_is_https = !first_is_https;
+                    Ok((codec::parse_join_slice(&body)?, other_is_https))
+                }
+                Err(_) => Err(first_error),
             }
         }
     }
+}
+
+/// Swap the URL scheme between `https` and `http`.
+fn switch_scheme(url: &reqwest::Url) -> Result<reqwest::Url, Error> {
+    let mut switched = url.clone();
+    let target_scheme = if url.scheme() == "https" {
+        "http"
+    } else {
+        "https"
+    };
+    switched
+        .set_scheme(target_scheme)
+        .map_err(|()| Error::InvalidInput("NetherNet URL scheme cannot be switched"))?;
+    Ok(switched)
 }
 
 /// Fetch the join response body with a deadline and a hard body size cap.
@@ -282,15 +350,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn https_transport_failure_falls_back_to_http() {
+    async fn https_transport_failure_falls_back_to_http_when_allowed() {
         let address = spawn_mock_join_server("HTTP/1.1 200 OK", HIVE_JOIN_JSON).await;
         let url = format!("https://{address}/v1/join");
 
-        let status = query_url(&url, QueryOptions::default())
+        // The fallback requires the explicit insecure-HTTP policy.
+        let denied = query_url(&url, QueryOptions::default())
             .await
-            .expect("http fallback should parse");
+            .expect_err("the insecure fallback is disabled by default");
+        assert!(matches!(
+            denied,
+            Error::Http(_) | Error::Timeout | Error::InvalidInput(_)
+        ));
+
+        let options = QueryOptions::default().allow_insecure_http(true);
+        let status = query_url(&url, options)
+            .await
+            .expect("http fallback should parse when the policy allows it");
 
         assert_eq!(status.motd, "HIVE-O-WEEN | BEDWARS S5");
+        assert_eq!(status.transport(), Transport::NetherNetHttp);
     }
 
     #[tokio::test]

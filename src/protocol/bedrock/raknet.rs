@@ -328,4 +328,49 @@ mod tests {
         assert_eq!(motd.motd_line_1, "Server");
         assert_eq!(motd.players_max, Some(8));
     }
+
+    #[test]
+    fn malformed_inputs_never_panic() {
+        // Truncations at every length of a valid pong.
+        let text = "MCPE;Server;589;1.21.100;1;8;12345;Line2;Survival;1;19132;19133;";
+        let mut pong = Vec::with_capacity(35 + text.len());
+        pong.push(UNCONNECTED_PONG);
+        pong.extend_from_slice(&1_i64.to_be_bytes());
+        pong.extend_from_slice(&2_i64.to_be_bytes());
+        pong.extend_from_slice(&RAKNET_MAGIC);
+        pong.extend_from_slice(
+            &u16::try_from(text.len())
+                .expect("fixture MOTD length fits in u16")
+                .to_be_bytes(),
+        );
+        pong.extend_from_slice(text.as_bytes());
+        for cut in 0..pong.len() {
+            let _ = decode_pong(&pong[..cut]);
+        }
+        // Corrupted packet ids, magic, and length prefixes.
+        let mut broken = pong.clone();
+        broken[0] = 0x00;
+        let _ = decode_pong(&broken);
+        broken = pong.clone();
+        broken[17] = 0xff;
+        let _ = decode_pong(&broken);
+        broken = pong.clone();
+        broken[33] = 0xff;
+        broken[34] = 0xff;
+        let _ = decode_pong(&broken);
+        // MOTD text edge cases: separators only, long semicolon runs, unicode.
+        for text in [
+            "",
+            ";",
+            ";;",
+            "MCPE",
+            "MCPE;",
+            ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;",
+            "MCPE;😀;589;1.21.100;0;0;0;;Survival;1;19132;19133;",
+            "\u{0}MCPE;Nul\u{0}",
+        ] {
+            let _ = decode_motd_text(text);
+        }
+        let _ = decode_pong(&[]);
+    }
 }

@@ -29,6 +29,14 @@ pub const DEFAULT_BEDROCK_PORT: u16 = 19_132;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(3_000);
 /// Default transport-cache capacity.
 pub const DEFAULT_CACHE_CAPACITY: usize = 1024;
+/// Minimum budget a single address attempt gets during multi-address
+/// failover, so a large candidate list still gives every address a usable
+/// slice of the shared deadline.
+pub(crate) const MIN_ATTEMPT_BUDGET: Duration = Duration::from_millis(250);
+/// How long a cache-hit transport is waited for exclusively before the other
+/// transport joins the race as a parallel fallback.
+#[cfg(feature = "nethernet")]
+pub(crate) const CACHE_GRACE: Duration = Duration::from_millis(600);
 /// Budget cap for the optional SRV lookup inside automatic queries.
 #[cfg(feature = "java")]
 pub(crate) const SRV_LOOKUP_BUDGET: Duration = Duration::from_secs(1);
@@ -38,54 +46,63 @@ const DEFAULT_MAX_RESPONSE_BYTES: usize = crate::bedrock::nethernet::DEFAULT_MAX
 /// Default `NetherNet` response body cap when the feature is compiled out.
 #[cfg(not(feature = "nethernet"))]
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+/// Default Java status packet cap (512 KiB; favicon-heavy responses stay well
+/// below this).
+pub const DEFAULT_MAX_JAVA_STATUS_BYTES: usize = 512 * 1024;
 
-/// Options for a single query.
+/// Per-query option overrides.
 ///
-/// Fields are public for direct construction and chainable methods exist for
-/// builder-style usage. The client-level defaults live in
-/// [`ClientBuilder`]; per-query options override them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Every field is an override: `None` (the default) inherits the value from
+/// the [`Client`] the query runs on, `Some` replaces it for this single
+/// query. Build values through the chainable methods or with struct
+/// update syntax — direct assignment is visible because the fields themselves
+/// carry the override state.
+///
+/// The client-level defaults live in [`ClientBuilder`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct QueryOptions {
     /// Edition restriction: `None` probes every compiled edition, `Some`
     /// restricts the query to one edition.
     pub edition: Option<Edition>,
     /// Java Edition port used for direct probing.
-    pub java_port: u16,
+    pub java_port: Option<u16>,
     /// Bedrock Edition port used for direct probing.
-    pub bedrock_port: u16,
+    pub bedrock_port: Option<u16>,
     /// End-to-end deadline for the whole query, including DNS and every
     /// probe. Not a per-stage timeout.
-    pub timeout: Duration,
+    pub timeout: Option<Duration>,
     /// Whether Java SRV lookup is attempted before direct probing.
     ///
     /// SRV lookup is a Java Edition concept, so a Bedrock-only query never
     /// consults SRV records.
-    pub try_srv: bool,
+    pub try_srv: Option<bool>,
     /// Whether a plain `http://` `NetherNet` endpoint on the same host and
     /// port may be tried after the primary `https://` attempt fails at the
     /// transport level. Receiving any HTTP status never triggers the
     /// fallback.
-    pub allow_insecure_http: bool,
+    ///
+    /// Defaults to disabled: a plain HTTP answer is not authenticated, so
+    /// callers who explicitly want NetherNet-over-HTTP compatibility must
+    /// opt in here (or on the client builder).
+    pub allow_insecure_http: Option<bool>,
     /// Maximum accepted `NetherNet` response body size in bytes.
-    pub max_response_bytes: usize,
-    /// Fields set through the chainable methods; see [`Self::merge_over`].
-    set_fields: u32,
+    pub max_response_bytes: Option<usize>,
+    /// Maximum accepted Java status packet size in bytes.
+    pub max_java_status_bytes: Option<usize>,
 }
 
-impl Default for QueryOptions {
-    fn default() -> Self {
-        Self {
-            edition: None,
-            java_port: DEFAULT_JAVA_PORT,
-            bedrock_port: DEFAULT_BEDROCK_PORT,
-            timeout: DEFAULT_TIMEOUT,
-            try_srv: true,
-            allow_insecure_http: true,
-            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
-            set_fields: 0,
-        }
-    }
+/// Fully resolved options used inside the query engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedOptions {
+    pub(crate) edition: Option<Edition>,
+    pub(crate) java_port: u16,
+    pub(crate) bedrock_port: u16,
+    pub(crate) timeout: Duration,
+    pub(crate) try_srv: bool,
+    pub(crate) allow_insecure_http: bool,
+    pub(crate) max_response_bytes: usize,
+    pub(crate) max_java_status_bytes: usize,
 }
 
 impl QueryOptions {
@@ -99,87 +116,82 @@ impl QueryOptions {
     /// Set the Java Edition port used for direct probing.
     #[must_use]
     pub fn java_port(mut self, port: u16) -> Self {
-        self.java_port = port;
-        self.set_fields |= Self::SET_JAVA_PORT;
+        self.java_port = Some(port);
         self
     }
 
     /// Set the Bedrock Edition port used for direct probing.
     #[must_use]
     pub fn bedrock_port(mut self, port: u16) -> Self {
-        self.bedrock_port = port;
-        self.set_fields |= Self::SET_BEDROCK_PORT;
+        self.bedrock_port = Some(port);
         self
     }
 
     /// Set the end-to-end query deadline.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self.set_fields |= Self::SET_TIMEOUT;
+        self.timeout = Some(timeout);
         self
     }
 
     /// Enable or disable Java SRV lookup.
     #[must_use]
     pub fn try_srv(mut self, try_srv: bool) -> Self {
-        self.try_srv = try_srv;
-        self.set_fields |= Self::SET_TRY_SRV;
+        self.try_srv = Some(try_srv);
         self
     }
 
     /// Allow or forbid the plain-HTTP `NetherNet` fallback.
     #[must_use]
     pub fn allow_insecure_http(mut self, allowed: bool) -> Self {
-        self.allow_insecure_http = allowed;
-        self.set_fields |= Self::SET_ALLOW_INSECURE_HTTP;
+        self.allow_insecure_http = Some(allowed);
         self
     }
 
     /// Set the maximum accepted `NetherNet` response body size.
     #[must_use]
     pub fn max_response_bytes(mut self, max_response_bytes: usize) -> Self {
-        self.max_response_bytes = max_response_bytes;
-        self.set_fields |= Self::SET_MAX_RESPONSE_BYTES;
+        self.max_response_bytes = Some(max_response_bytes);
         self
     }
 
-    /// Which fields were set through the chainable methods.
-    ///
-    /// Used by [`Client::query_with`] to apply per-query overrides on top of
-    /// the client defaults instead of replacing them wholesale.
-    const SET_JAVA_PORT: u32 = 1 << 0;
-    const SET_BEDROCK_PORT: u32 = 1 << 1;
-    const SET_TIMEOUT: u32 = 1 << 2;
-    const SET_TRY_SRV: u32 = 1 << 3;
-    const SET_ALLOW_INSECURE_HTTP: u32 = 1 << 4;
-    const SET_MAX_RESPONSE_BYTES: u32 = 1 << 5;
+    /// Set the maximum accepted Java status packet size.
+    #[must_use]
+    pub fn max_java_status_bytes(mut self, max_java_status_bytes: usize) -> Self {
+        self.max_java_status_bytes = Some(max_java_status_bytes);
+        self
+    }
 
-    /// Merge these options over `base` (the client defaults), applying only
-    /// the fields that were set explicitly on this value. The edition always
-    /// comes from this value: `None` means probe every compiled edition.
-    pub(crate) fn merge_over(&self, base: &QueryOptions) -> QueryOptions {
-        let mut merged = base.clone();
-        if self.set_fields & Self::SET_JAVA_PORT != 0 {
-            merged.java_port = self.java_port;
+    /// Resolve these options over `base` (the client defaults): every `None`
+    /// field inherits the base value, every `Some` field overrides it.
+    pub(crate) fn resolve_over(&self, base: &QueryOptions) -> ResolvedOptions {
+        ResolvedOptions {
+            edition: self.edition.or(base.edition),
+            java_port: self
+                .java_port
+                .or(base.java_port)
+                .unwrap_or(DEFAULT_JAVA_PORT),
+            bedrock_port: self
+                .bedrock_port
+                .or(base.bedrock_port)
+                .unwrap_or(DEFAULT_BEDROCK_PORT),
+            timeout: self.timeout.or(base.timeout).unwrap_or(DEFAULT_TIMEOUT),
+            try_srv: self.try_srv.or(base.try_srv).unwrap_or(true),
+            // Insecure HTTP stays disabled unless a builder or a per-query
+            // override explicitly allows it.
+            allow_insecure_http: self
+                .allow_insecure_http
+                .or(base.allow_insecure_http)
+                .unwrap_or(false),
+            max_response_bytes: self
+                .max_response_bytes
+                .or(base.max_response_bytes)
+                .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES),
+            max_java_status_bytes: self
+                .max_java_status_bytes
+                .or(base.max_java_status_bytes)
+                .unwrap_or(DEFAULT_MAX_JAVA_STATUS_BYTES),
         }
-        if self.set_fields & Self::SET_BEDROCK_PORT != 0 {
-            merged.bedrock_port = self.bedrock_port;
-        }
-        if self.set_fields & Self::SET_TIMEOUT != 0 {
-            merged.timeout = self.timeout;
-        }
-        if self.set_fields & Self::SET_TRY_SRV != 0 {
-            merged.try_srv = self.try_srv;
-        }
-        if self.set_fields & Self::SET_ALLOW_INSECURE_HTTP != 0 {
-            merged.allow_insecure_http = self.allow_insecure_http;
-        }
-        if self.set_fields & Self::SET_MAX_RESPONSE_BYTES != 0 {
-            merged.max_response_bytes = self.max_response_bytes;
-        }
-        merged.edition = self.edition;
-        merged
     }
 }
 
@@ -201,6 +213,10 @@ struct ClientInner {
     cache: TransportCache,
     #[cfg(feature = "nethernet")]
     http: reqwest::Client,
+    /// SRV resolver shared by this client's Java queries (also holds the
+    /// background task hickory needs).
+    #[cfg(feature = "java")]
+    pub(crate) resolver: hickory_resolver::TokioResolver,
 }
 
 /// Reusable query client.
@@ -211,12 +227,6 @@ struct ClientInner {
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<ClientInner>,
-}
-
-impl Default for Client {
-    fn default() -> Self {
-        Self::builder().build()
-    }
 }
 
 impl Client {
@@ -237,8 +247,13 @@ impl Client {
     /// Returns [`crate::error::Error`] for invalid input, DNS failures, I/O failures, or
     /// when no compatible server answers.
     pub async fn query(&self, address: impl AsRef<str>) -> Result<Status> {
-        let parsed = Self::parse(address, &self.inner.options)?;
-        engine::full(&self.parts(), &parsed, &self.inner.options).await
+        let resolved = self.inner.options.resolve_over(&QueryOptions::default());
+        let parsed = Self::parse(address, &resolved)?;
+        #[cfg(feature = "java")]
+        let status = engine::full(&self.parts(), &parsed, &resolved, self.srv_resolver()).await;
+        #[cfg(not(feature = "java"))]
+        let status = engine::full(&self.parts(), &parsed, &resolved).await;
+        status
     }
 
     /// Query a server address with explicit per-query options.
@@ -251,11 +266,16 @@ impl Client {
         address: impl AsRef<str>,
         options: QueryOptions,
     ) -> Result<Status> {
-        // Per-query options layer on top of the client defaults: only the
-        // fields set through the chainable methods replace the builder values.
-        let merged = options.merge_over(&self.inner.options);
-        let parsed = Self::parse(address, &merged)?;
-        engine::full(&self.parts(), &parsed, &merged).await
+        // Per-query options layer on top of the client defaults: `None`
+        // fields inherit the builder values.
+        let resolved = options.resolve_over(&self.inner.options);
+        let parsed = Self::parse(address, &resolved)?;
+        #[cfg(feature = "java")]
+        let full_result =
+            engine::full(&self.parts(), &parsed, &resolved, self.srv_resolver()).await;
+        #[cfg(not(feature = "java"))]
+        let full_result = engine::full(&self.parts(), &parsed, &resolved).await;
+        full_result
     }
 
     /// Query a Java Edition server address.
@@ -266,9 +286,14 @@ impl Client {
     /// restricted to Java.
     #[cfg(feature = "java")]
     pub async fn java(&self, address: impl AsRef<str>) -> Result<Status> {
-        let options = self.inner.options.clone().edition(Edition::Java);
-        let parsed = Self::parse(address, &options)?;
-        engine::java(&self.parts(), &parsed, &options).await
+        let resolved = self
+            .inner
+            .options
+            .clone()
+            .edition(Edition::Java)
+            .resolve_over(&QueryOptions::default());
+        let parsed = Self::parse(address, &resolved)?;
+        engine::java(&self.parts(), &parsed, &resolved, self.srv_resolver()).await
     }
 
     /// Query a Java Edition server address with explicit options.
@@ -282,11 +307,11 @@ impl Client {
         address: impl AsRef<str>,
         options: QueryOptions,
     ) -> Result<Status> {
-        let options = options
+        let resolved = options
             .edition(Edition::Java)
-            .merge_over(&self.inner.options);
-        let parsed = Self::parse(address, &options)?;
-        engine::java(&self.parts(), &parsed, &options).await
+            .resolve_over(&self.inner.options);
+        let parsed = Self::parse(address, &resolved)?;
+        engine::java(&self.parts(), &parsed, &resolved, self.srv_resolver()).await
     }
 
     /// Query a Bedrock Edition server address with automatic transport
@@ -298,9 +323,14 @@ impl Client {
     /// restricted to Bedrock.
     #[cfg(feature = "bedrock")]
     pub async fn bedrock(&self, address: impl AsRef<str>) -> Result<Status> {
-        let options = self.inner.options.clone().edition(Edition::Bedrock);
-        let parsed = Self::parse(address, &options)?;
-        engine::bedrock(&self.parts(), &parsed, &options).await
+        let resolved = self
+            .inner
+            .options
+            .clone()
+            .edition(Edition::Bedrock)
+            .resolve_over(&QueryOptions::default());
+        let parsed = Self::parse(address, &resolved)?;
+        engine::bedrock(&self.parts(), &parsed, &resolved).await
     }
 
     /// Query a Bedrock Edition server address with explicit options.
@@ -314,11 +344,11 @@ impl Client {
         address: impl AsRef<str>,
         options: QueryOptions,
     ) -> Result<Status> {
-        let options = options
+        let resolved = options
             .edition(Edition::Bedrock)
-            .merge_over(&self.inner.options);
-        let parsed = Self::parse(address, &options)?;
-        engine::bedrock(&self.parts(), &parsed, &options).await
+            .resolve_over(&self.inner.options);
+        let parsed = Self::parse(address, &resolved)?;
+        engine::bedrock(&self.parts(), &parsed, &resolved).await
     }
 
     /// Query a Bedrock Edition server address over `RakNet` only.
@@ -329,8 +359,9 @@ impl Client {
     /// restricted to the `RakNet` transport.
     #[cfg(feature = "bedrock")]
     pub async fn raknet(&self, address: impl AsRef<str>) -> Result<Status> {
-        let parsed = Self::parse(address, &self.inner.options)?;
-        engine::raknet(&self.parts(), &parsed, &self.inner.options).await
+        let resolved = self.inner.options.resolve_over(&QueryOptions::default());
+        let parsed = Self::parse(address, &resolved)?;
+        engine::raknet(&self.parts(), &parsed, &resolved).await
     }
 
     /// Query a Bedrock Edition server address over `RakNet` only with explicit
@@ -345,9 +376,9 @@ impl Client {
         address: impl AsRef<str>,
         options: QueryOptions,
     ) -> Result<Status> {
-        let merged = options.merge_over(&self.inner.options);
-        let parsed = Self::parse(address, &merged)?;
-        engine::raknet(&self.parts(), &parsed, &merged).await
+        let resolved = options.resolve_over(&self.inner.options);
+        let parsed = Self::parse(address, &resolved)?;
+        engine::raknet(&self.parts(), &parsed, &resolved).await
     }
 
     /// Query a Bedrock Edition server address over `NetherNet` only.
@@ -358,8 +389,9 @@ impl Client {
     /// restricted to the `NetherNet` transport.
     #[cfg(feature = "nethernet")]
     pub async fn nethernet(&self, address: impl AsRef<str>) -> Result<Status> {
-        let parsed = Self::parse(address, &self.inner.options)?;
-        engine::nethernet(&self.parts(), &parsed, &self.inner.options).await
+        let resolved = self.inner.options.resolve_over(&QueryOptions::default());
+        let parsed = Self::parse(address, &resolved)?;
+        engine::nethernet(&self.parts(), &parsed, &resolved).await
     }
 
     /// Query a Bedrock Edition server address over `NetherNet` only with
@@ -374,9 +406,15 @@ impl Client {
         address: impl AsRef<str>,
         options: QueryOptions,
     ) -> Result<Status> {
-        let merged = options.merge_over(&self.inner.options);
-        let parsed = Self::parse(address, &merged)?;
-        engine::nethernet(&self.parts(), &parsed, &merged).await
+        let resolved = options.resolve_over(&self.inner.options);
+        let parsed = Self::parse(address, &resolved)?;
+        engine::nethernet(&self.parts(), &parsed, &resolved).await
+    }
+
+    /// Shared SRV resolver used by this client's Java queries.
+    #[cfg(feature = "java")]
+    pub(crate) fn srv_resolver(&self) -> &hickory_resolver::TokioResolver {
+        &self.inner.resolver
     }
 
     /// Return the cached transport for a Bedrock `host:port`, if present and
@@ -394,6 +432,7 @@ impl Client {
     }
 
     #[allow(clippy::unused_self)] // the borrowed resources differ per feature set
+    #[allow(clippy::unused_self)]
     fn parts(&self) -> Parts<'_> {
         Parts {
             _lifetime: std::marker::PhantomData,
@@ -404,8 +443,8 @@ impl Client {
         }
     }
 
-    fn parse(address: impl AsRef<str>, options: &QueryOptions) -> Result<ServerAddress> {
-        address::parse_server_address(address.as_ref(), options.java_port, options.bedrock_port)
+    fn parse(address: impl AsRef<str>, resolved: &ResolvedOptions) -> Result<ServerAddress> {
+        address::parse_server_address(address.as_ref(), resolved.java_port, resolved.bedrock_port)
     }
 }
 
@@ -432,42 +471,42 @@ impl ClientBuilder {
     /// Set the default end-to-end query deadline.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.options.timeout = timeout;
+        self.options.timeout = Some(timeout);
         self
     }
 
     /// Set the default Java Edition port.
     #[must_use]
     pub fn java_port(mut self, port: u16) -> Self {
-        self.options.java_port = port;
+        self.options.java_port = Some(port);
         self
     }
 
     /// Set the default Bedrock Edition port.
     #[must_use]
     pub fn bedrock_port(mut self, port: u16) -> Self {
-        self.options.bedrock_port = port;
+        self.options.bedrock_port = Some(port);
         self
     }
 
     /// Enable or disable Java SRV lookup by default.
     #[must_use]
     pub fn try_srv(mut self, try_srv: bool) -> Self {
-        self.options.try_srv = try_srv;
+        self.options.try_srv = Some(try_srv);
         self
     }
 
     /// Allow or forbid the plain-HTTP `NetherNet` fallback by default.
     #[must_use]
     pub fn allow_insecure_http(mut self, allowed: bool) -> Self {
-        self.options.allow_insecure_http = allowed;
+        self.options.allow_insecure_http = Some(allowed);
         self
     }
 
     /// Set the default `NetherNet` response body cap.
     #[must_use]
     pub fn max_response_bytes(mut self, max_response_bytes: usize) -> Self {
-        self.options.max_response_bytes = max_response_bytes;
+        self.options.max_response_bytes = Some(max_response_bytes);
         self
     }
 
@@ -480,29 +519,40 @@ impl ClientBuilder {
     }
 
     /// Build the client.
-    #[must_use]
-    pub fn build(self) -> Client {
-        Client {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::Http`] when the `NetherNet` HTTP client
+    /// cannot be constructed, instead of silently substituting a differently
+    /// configured client.
+    pub fn build(self) -> std::result::Result<Client, crate::error::Error> {
+        #[cfg(feature = "nethernet")]
+        let http = crate::bedrock::nethernet::build_http_client();
+        #[cfg(feature = "java")]
+        let resolver = hickory_resolver::Resolver::builder_tokio()
+            .map_err(|error| crate::error::Error::Dns(error.to_string()))?
+            .build();
+        Ok(Client {
             inner: Arc::new(ClientInner {
                 options: self.options,
                 #[cfg(feature = "bedrock")]
                 cache: TransportCache::new(self.cache_capacity),
                 #[cfg(feature = "nethernet")]
-                http: build_http_client(),
+                http,
+                #[cfg(feature = "java")]
+                resolver,
             }),
-        }
+        })
     }
 }
 
-#[cfg(feature = "nethernet")]
-fn build_http_client() -> reqwest::Client {
-    crate::bedrock::nethernet::build_http_client()
-}
+static DEFAULT_CLIENT: OnceLock<std::result::Result<Client, String>> = OnceLock::new();
 
-static DEFAULT_CLIENT: OnceLock<Client> = OnceLock::new();
-
-pub(crate) fn default_client() -> &'static Client {
-    DEFAULT_CLIENT.get_or_init(Client::default)
+pub(crate) fn default_client() -> std::result::Result<&'static Client, crate::error::Error> {
+    DEFAULT_CLIENT
+        .get_or_init(|| Client::builder().build().map_err(|error| error.to_string()))
+        .as_ref()
+        .map_err(|message| crate::error::Error::Http(message.clone()))
 }
 
 /// Internal query engine shared by the free functions and [`Client`].
@@ -515,7 +565,7 @@ pub(crate) mod engine {
     use tokio::net::lookup_host;
     use tokio::time;
 
-    use super::{Parts, QueryOptions};
+    use super::{Parts, ResolvedOptions};
     use crate::address::ServerAddress;
     #[cfg(feature = "bedrock")]
     use crate::bedrock;
@@ -532,16 +582,24 @@ pub(crate) mod engine {
     pub(crate) async fn full(
         parts: &Parts<'_>,
         address: &ServerAddress,
-        options: &QueryOptions,
+        resolved: &ResolvedOptions,
+        #[cfg(feature = "java")] srv_resolver: &hickory_resolver::TokioResolver,
     ) -> Result<Status> {
         let started = Instant::now();
-        let deadline = started + options.timeout;
-        let result = match options.edition {
+        let deadline = started
+            .checked_add(resolved.timeout)
+            .ok_or(Error::InvalidInput("query timeout is too large"))?;
+        let result = match resolved.edition {
             #[cfg(feature = "java")]
-            Some(Edition::Java) => java::run(address, options, deadline).await,
+            Some(Edition::Java) => java::run(address, resolved, deadline, srv_resolver).await,
             #[cfg(feature = "bedrock")]
-            Some(Edition::Bedrock) => bedrock::run(parts, address, options, deadline).await,
-            None => auto_probe(parts, address, options, deadline).await,
+            Some(Edition::Bedrock) => bedrock::run(parts, address, resolved, deadline).await,
+            #[cfg(all(feature = "java", feature = "bedrock"))]
+            None => auto_probe(parts, address, resolved, deadline, srv_resolver).await,
+            #[cfg(all(feature = "java", not(feature = "bedrock")))]
+            None => auto_probe(parts, address, resolved, deadline, srv_resolver).await,
+            #[cfg(all(not(feature = "java"), feature = "bedrock"))]
+            None => auto_probe(parts, address, resolved, deadline).await,
         };
         finish(started, result)
     }
@@ -551,12 +609,18 @@ pub(crate) mod engine {
     pub(crate) async fn java(
         parts: &Parts<'_>,
         address: &ServerAddress,
-        options: &QueryOptions,
+        resolved: &ResolvedOptions,
+        srv_resolver: &hickory_resolver::TokioResolver,
     ) -> Result<Status> {
         let _ = parts;
         let started = Instant::now();
-        let deadline = started + options.timeout;
-        finish(started, java::run(address, options, deadline).await)
+        let deadline = started
+            .checked_add(resolved.timeout)
+            .ok_or(Error::InvalidInput("query timeout is too large"))?;
+        finish(
+            started,
+            java::run(address, resolved, deadline, srv_resolver).await,
+        )
     }
 
     /// Run a Bedrock-only query with automatic transport selection.
@@ -564,13 +628,15 @@ pub(crate) mod engine {
     pub(crate) async fn bedrock(
         parts: &Parts<'_>,
         address: &ServerAddress,
-        options: &QueryOptions,
+        resolved: &ResolvedOptions,
     ) -> Result<Status> {
         let started = Instant::now();
-        let deadline = started + options.timeout;
+        let deadline = started
+            .checked_add(resolved.timeout)
+            .ok_or(Error::InvalidInput("query timeout is too large"))?;
         finish(
             started,
-            bedrock::run(parts, address, options, deadline).await,
+            bedrock::run(parts, address, resolved, deadline).await,
         )
     }
 
@@ -579,10 +645,12 @@ pub(crate) mod engine {
     pub(crate) async fn raknet(
         parts: &Parts<'_>,
         address: &ServerAddress,
-        options: &QueryOptions,
+        resolved: &ResolvedOptions,
     ) -> Result<Status> {
         let started = Instant::now();
-        let deadline = started + options.timeout;
+        let deadline = started
+            .checked_add(resolved.timeout)
+            .ok_or(Error::InvalidInput("query timeout is too large"))?;
         let ips = resolve_probe_ips(&address.host, deadline).await?;
         let result = bedrock::raknet::probe(address, deadline, &ips, parts).await;
         finish(started, result.map_err(|attempt| *attempt.error))
@@ -593,11 +661,14 @@ pub(crate) mod engine {
     pub(crate) async fn nethernet(
         parts: &Parts<'_>,
         address: &ServerAddress,
-        options: &QueryOptions,
+        resolved: &ResolvedOptions,
     ) -> Result<Status> {
         let started = Instant::now();
-        let deadline = started + options.timeout;
-        let result = crate::bedrock::nethernet::probe(address, deadline, parts, options).await;
+        let deadline = started
+            .checked_add(resolved.timeout)
+            .ok_or(Error::InvalidInput("query timeout is too large"))?;
+        let result =
+            crate::bedrock::nethernet::probe(address, deadline, parts, resolved, true).await;
         finish(started, result.map_err(|attempt| *attempt.error))
     }
 
@@ -605,21 +676,22 @@ pub(crate) mod engine {
     async fn auto_probe(
         parts: &Parts<'_>,
         address: &ServerAddress,
-        options: &QueryOptions,
+        resolved: &ResolvedOptions,
         deadline: Instant,
+        #[cfg(feature = "java")] srv_resolver: &hickory_resolver::TokioResolver,
     ) -> Result<Status> {
         let _ = parts;
         #[cfg(all(feature = "java", feature = "bedrock"))]
         {
-            return java_then_bedrock(parts, address, options, deadline).await;
+            return java_then_bedrock(parts, address, resolved, deadline, srv_resolver).await;
         }
         #[cfg(all(feature = "java", not(feature = "bedrock")))]
         {
-            return java::run(address, options, deadline).await;
+            return java::run(address, resolved, deadline, srv_resolver).await;
         }
         #[cfg(all(not(feature = "java"), feature = "bedrock"))]
         {
-            bedrock::run(parts, address, options, deadline).await
+            bedrock::run(parts, address, resolved, deadline).await
         }
     }
 
@@ -633,11 +705,12 @@ pub(crate) mod engine {
     async fn java_then_bedrock(
         parts: &Parts<'_>,
         address: &ServerAddress,
-        options: &QueryOptions,
+        resolved: &ResolvedOptions,
         deadline: Instant,
+        srv_resolver: &hickory_resolver::TokioResolver,
     ) -> Result<Status> {
         let java_future = async move {
-            java::run(address, options, deadline)
+            java::run(address, resolved, deadline, srv_resolver)
                 .await
                 .map_err(|error| match error {
                     Error::NoCompatibleJavaServer { attempts, .. } => attempts,
@@ -649,7 +722,7 @@ pub(crate) mod engine {
                 })
         };
         let bedrock_future = async move {
-            bedrock::run(parts, address, options, deadline)
+            bedrock::run(parts, address, resolved, deadline)
                 .await
                 .map_err(|error| match error {
                     Error::NoCompatibleBedrockServer { attempts, .. } => attempts,
@@ -763,11 +836,12 @@ mod tests {
     const MOCK_MOTD_TEXT: &str =
         "MCPE;RakNet Mock;589;1.21.100;3;20;12345;Line2;Survival;1;19132;19133;";
 
-    /// Build a `RakNet` unconnected pong packet carrying the MOTD text.
-    fn build_pong(text: &str) -> Vec<u8> {
+    /// Build a `RakNet` unconnected pong packet carrying the MOTD text and
+    /// echoing the ping timestamp.
+    fn build_pong(ping_time: [u8; 8], text: &str) -> Vec<u8> {
         let mut packet = Vec::with_capacity(35 + text.len());
         packet.push(0x1c);
-        packet.extend_from_slice(&1_i64.to_be_bytes());
+        packet.extend_from_slice(&ping_time);
         packet.extend_from_slice(&2_i64.to_be_bytes());
         packet.extend_from_slice(&[
             0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34,
@@ -801,7 +875,7 @@ mod tests {
                 if len != 33 {
                     return;
                 }
-                let pong = build_pong(MOCK_MOTD_TEXT);
+                let pong = build_pong(buffer[1..9].try_into().expect("8 bytes"), MOCK_MOTD_TEXT);
                 let _ = socket.send_to(&pong, peer).await;
             }
         });
@@ -811,7 +885,10 @@ mod tests {
     #[cfg(all(feature = "java", feature = "bedrock"))]
     #[tokio::test]
     async fn client_race_returns_bedrock_when_java_absent() {
-        let client = Client::builder().timeout(Duration::from_secs(3)).build();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("test client should build");
         let mock = spawn_pong_mock().await;
         let address = format!("{}:{}", mock.ip(), mock.port());
 
@@ -829,7 +906,10 @@ mod tests {
     #[cfg(feature = "bedrock")]
     #[tokio::test]
     async fn bedrock_query_caches_transport() {
-        let client = Client::builder().timeout(Duration::from_secs(3)).build();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("test client should build");
         let mock = spawn_pong_mock().await;
         let host = mock.ip().to_string();
         let port = mock.port();
@@ -859,7 +939,8 @@ mod tests {
     async fn end_to_end_deadline_bounds_the_whole_query() {
         let client = Client::builder()
             .timeout(Duration::from_millis(250))
-            .build();
+            .build()
+            .expect("test client should build");
 
         // Port 1 on the loopback interface is virtually always closed.
         let started = std::time::Instant::now();
@@ -868,9 +949,14 @@ mod tests {
             .await
             .expect_err("closed port should fail");
 
+        // The aggregate variant depends on the compiled edition set
+        // (java-only, bedrock-only, or both).
         assert!(matches!(
             error,
-            Error::Timeout | Error::NoCompatibleServer { .. }
+            Error::Timeout
+                | Error::NoCompatibleServer { .. }
+                | Error::NoCompatibleJavaServer { .. }
+                | Error::NoCompatibleBedrockServer { .. }
         ));
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -882,7 +968,10 @@ mod tests {
     #[cfg(feature = "bedrock")]
     #[tokio::test]
     async fn query_with_can_restrict_the_edition() {
-        let client = Client::builder().timeout(Duration::from_secs(3)).build();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("test client should build");
         let mock = spawn_pong_mock().await;
         let address = format!("{}:{}", mock.ip(), mock.port());
 
@@ -895,21 +984,24 @@ mod tests {
     }
 
     #[test]
-    fn query_with_merges_over_client_defaults() {
+    fn query_with_resolves_over_client_defaults() {
         // The builder pins a java port; a per-query timeout must not reset it.
-        let client = Client::builder().java_port(25_599).build();
-        let merged = QueryOptions::default()
+        let client = Client::builder()
+            .java_port(25_599)
+            .build()
+            .expect("test client should build");
+        let resolved = QueryOptions::default()
             .timeout(Duration::from_secs(7))
-            .merge_over(&client.inner.options);
+            .resolve_over(&client.inner.options);
 
-        assert_eq!(merged.timeout, Duration::from_secs(7));
-        assert_eq!(merged.java_port, 25_599);
+        assert_eq!(resolved.timeout, Duration::from_secs(7));
+        assert_eq!(resolved.java_port, 25_599);
 
         // Explicit per-query fields do override the builder.
-        let merged = QueryOptions::default()
+        let resolved = QueryOptions::default()
             .java_port(25_600)
-            .merge_over(&client.inner.options);
-        assert_eq!(merged.java_port, 25_600);
+            .resolve_over(&client.inner.options);
+        assert_eq!(resolved.java_port, 25_600);
     }
 
     #[cfg(feature = "bedrock")]
@@ -918,7 +1010,8 @@ mod tests {
         let client = Client::builder()
             .timeout(Duration::from_millis(400))
             .allow_insecure_http(false)
-            .build();
+            .build()
+            .expect("test client should build");
 
         // Port 1 on the loopback interface is virtually always closed, so
         // both Bedrock transports fail.
@@ -931,11 +1024,24 @@ mod tests {
             Error::NoCompatibleBedrockServer { attempts, .. } => attempts,
             other => panic!("expected an aggregate error, got {other:?}"),
         };
-        assert_eq!(
-            attempts.len(),
-            2,
-            "the cached-transport fallback keeps both probe failures"
-        );
+        // Expect one attempt per compiled transport: both with NetherNet and
+        // RakNet, one with RakNet only.
+        #[cfg(feature = "nethernet")]
+        {
+            assert_eq!(
+                attempts.len(),
+                2,
+                "both probe failures are kept, got {attempts:?}"
+            );
+        }
+        #[cfg(not(feature = "nethernet"))]
+        {
+            assert_eq!(
+                attempts.len(),
+                1,
+                "a single compiled transport yields a single attempt"
+            );
+        }
         // The aggregate error chains to the first probe failure.
         assert!(
             std::error::Error::source(&error).is_some(),

@@ -16,7 +16,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client = Client::builder()
         .timeout(Duration::from_secs(3))
         .cache_capacity(256)
-        .build();
+        .build()?;
     let status = client.bedrock(&address).await?;
 
     println!(

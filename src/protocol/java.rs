@@ -8,7 +8,6 @@ use crate::error::Error;
 const STATUS_STATE: i32 = 1;
 const HANDSHAKE_PACKET_ID: i32 = 0;
 const STATUS_REQUEST_PACKET_ID: i32 = 0;
-const MAX_JAVA_STATUS_PACKET_LEN: usize = 2 * 1024 * 1024;
 
 /// Build the two-frame Java Edition status request.
 ///
@@ -72,9 +71,6 @@ pub fn parse_status_response(packet: &[u8]) -> Result<&str, Error> {
 
     std::str::from_utf8(&packet[cursor..json_end]).map_err(Error::from)
 }
-
-/// Maximum accepted Java status packet length.
-pub(crate) const MAX_STATUS_PACKET_LEN: usize = MAX_JAVA_STATUS_PACKET_LEN;
 
 /// Read one `VarInt` from the stream while it stays readable.
 pub(crate) async fn read_varint(stream: &mut tokio::net::TcpStream) -> Result<i32, Error> {

@@ -125,8 +125,20 @@ let status = client
   HTTP 状态码都不会触发回退。
 - SRV 记录按优先级排序，同优先级内使用 RFC 2782 加权随机选择；零权重记录的
   区间为空，只有在没有其他记录时才会被排序。显式指定端口时完全跳过 SRV。
-- 状态包中 JSON 无法解析属于协议错误（`Error::InvalidPacket`），不会产生空白
-  状态；缺失的可选字段保持宽容。
+- 状态包中 JSON 无法解析——或不是 JSON 对象——属于协议错误
+  （`Error::InvalidPacket`），不会产生空白状态；缺失的可选字段保持宽容。
+  JSON 每次查询只解析一次。
+- SRV 记录指向 `.` 或端口 0 表示服务明确不可用，会作为 attempt 错误暴露，
+  而不是静默回退直连。
+- `allow_insecure_http` 默认为**禁用**：明文 HTTP 的 NetherNet 应答未经身份
+  验证，需要明文兼容的调用方必须在 builder 或单次查询中显式开启。
+  `Transport::NetherNetHttp` 表示不安全的明文应答，`NetherNetHttps` 表示
+  经过证书验证的应答。
+- LAN 发现按 socket 地址去重（同一主机上的多个服务器都会上报）、限制结果
+  数量（`max_results`，默认 32），并将 pong 与 ping 时间戳关联以忽略过期
+  回复。
+- 整个 crate `forbid unsafe_code`，CI 增加 `cargo audit` 依赖审计与 Windows
+  平台任务。
 
 ## 协议层
 

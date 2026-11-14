@@ -31,7 +31,7 @@ pub const PONG_BUFFER_SIZE: usize = 2048;
 /// Returns [`Error`] if the address is invalid, DNS lookup fails, the UDP
 /// exchange fails or times out, or the pong packet is invalid.
 pub async fn query(address: impl AsRef<str>) -> Result<Status> {
-    crate::client::default_client().raknet(address).await
+    crate::client::default_client()?.raknet(address).await
 }
 
 /// Query a Bedrock Edition server address over `RakNet` only with explicit
@@ -41,7 +41,7 @@ pub async fn query(address: impl AsRef<str>) -> Result<Status> {
 ///
 /// Returns [`Error`] under the same conditions as [`query`].
 pub async fn query_with(address: impl AsRef<str>, options: QueryOptions) -> Result<Status> {
-    crate::client::default_client()
+    crate::client::default_client()?
         .raknet_with(address, options)
         .await
 }
@@ -93,12 +93,20 @@ pub async fn query_addr_into(
     .await
     .map_err(|_| Error::Timeout)??;
 
-    let len = time::timeout(
-        crate::client::engine::remaining(deadline)?,
-        socket.recv(&mut buffer[..]),
-    )
-    .await
-    .map_err(|_| Error::Timeout)??;
+    // Correlate the pong with our ping timestamp: stale or foreign pongs are
+    // ignored until the deadline runs out.
+    let expected_time = ping[1..9].to_vec();
+    let len = loop {
+        let received = time::timeout(
+            crate::client::engine::remaining(deadline)?,
+            socket.recv(&mut buffer[..]),
+        )
+        .await
+        .map_err(|_| Error::Timeout)??;
+        if buffer.len() >= 9 && buffer[1..9] == expected_time[..] {
+            break received;
+        }
+    };
 
     codec::decode_pong(&buffer[..len])
 }
@@ -117,9 +125,15 @@ async fn query_host(host: &str, port: u16, deadline: Instant) -> Result<RakNetDe
 
     let mut buffer = vec![0_u8; PONG_BUFFER_SIZE];
     let mut last = None;
+    // Fair-share the shared deadline across the remaining addresses so a
+    // silently dropping first address cannot starve the failover candidates.
+    let mut attempts_left = addresses.len();
     for address in addresses {
-        let remaining = crate::client::engine::remaining(deadline)?;
-        match query_addr_into(address, &mut buffer, remaining).await {
+        let share = crate::client::engine::remaining(deadline)?
+            / u32::try_from(attempts_left).unwrap_or(u32::MAX);
+        let attempt_budget = share.max(crate::client::MIN_ATTEMPT_BUDGET);
+        attempts_left = attempts_left.saturating_sub(1);
+        match query_addr_into(address, &mut buffer, attempt_budget).await {
             Ok(pong) => return Ok(pong.to_owned()),
             Err(error) => last = Some(error),
         }
@@ -144,11 +158,16 @@ pub(crate) async fn probe(
             return query_host(&address.host, port, deadline).await;
         }
         // UDP has no fast failure signal, so every resolved address is tried
-        // in order until one answers or the shared deadline runs out.
+        // in order with a fair share of the shared deadline; a silently
+        // dropping first address cannot starve the failover candidates.
         let mut last = None;
+        let mut attempts_left = ips.len();
         for ip in ips {
-            let remaining = crate::client::engine::remaining(deadline)?;
-            match query_addr_into(SocketAddr::new(*ip, port), &mut buffer, remaining).await {
+            let share = crate::client::engine::remaining(deadline)?
+                / u32::try_from(attempts_left).unwrap_or(u32::MAX);
+            let attempt_budget = share.max(crate::client::MIN_ATTEMPT_BUDGET);
+            attempts_left = attempts_left.saturating_sub(1);
+            match query_addr_into(SocketAddr::new(*ip, port), &mut buffer, attempt_budget).await {
                 Ok(pong) => return Ok(pong.to_owned()),
                 Err(error) => last = Some(error),
             }
@@ -185,10 +204,10 @@ mod tests {
         "MCPE;RakNet Mock;589;1.21.100;3;20;12345;Line2;Survival;1;19132;19133;";
 
     /// Build a `RakNet` unconnected pong packet carrying the MOTD text.
-    fn build_pong(text: &str) -> Vec<u8> {
+    fn build_pong(ping_time: [u8; 8], text: &str) -> Vec<u8> {
         let mut packet = Vec::with_capacity(35 + text.len());
         packet.push(0x1c);
-        packet.extend_from_slice(&1_i64.to_be_bytes());
+        packet.extend_from_slice(&ping_time);
         packet.extend_from_slice(&2_i64.to_be_bytes());
         packet.extend_from_slice(&[
             0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34,
@@ -217,7 +236,11 @@ mod tests {
                 if len != 33 {
                     return;
                 }
-                let pong = build_pong(MOCK_MOTD_TEXT);
+                // Echo the ping timestamp so the correlation check passes.
+                let pong = build_pong(
+                    buffer[1..9].try_into().expect("ping time fits in 8 bytes"),
+                    MOCK_MOTD_TEXT,
+                );
                 let _ = socket.send_to(&pong, peer).await;
             }
         });

@@ -36,7 +36,12 @@ pub enum Transport {
     /// Bedrock Edition `RakNet` unconnected ping over UDP.
     #[cfg(feature = "bedrock")]
     RakNetUdp,
-    /// Bedrock Edition `NetherNet` join endpoint over HTTPS/HTTP.
+    /// Bedrock Edition `NetherNet` join endpoint over HTTPS (verified by the
+    /// webpki certificate chain).
+    #[cfg(feature = "nethernet")]
+    NetherNetHttps,
+    /// Bedrock Edition `NetherNet` join endpoint over plain HTTP, reached
+    /// only when the insecure-HTTP policy was enabled for the query.
     #[cfg(feature = "nethernet")]
     NetherNetHttp,
 }
@@ -49,7 +54,9 @@ impl std::fmt::Display for Transport {
             #[cfg(feature = "bedrock")]
             Self::RakNetUdp => formatter.write_str("RakNet UDP"),
             #[cfg(feature = "nethernet")]
-            Self::NetherNetHttp => formatter.write_str("NetherNet HTTP"),
+            Self::NetherNetHttps => formatter.write_str("NetherNet HTTPS"),
+            #[cfg(feature = "nethernet")]
+            Self::NetherNetHttp => formatter.write_str("NetherNet HTTP (insecure)"),
         }
     }
 }
@@ -141,7 +148,13 @@ impl BedrockDetails {
         match self {
             Self::RakNet(_) => Transport::RakNetUdp,
             #[cfg(feature = "nethernet")]
-            Self::NetherNet(_) => Transport::NetherNetHttp,
+            Self::NetherNet(details) => {
+                if details.insecure_http {
+                    Transport::NetherNetHttp
+                } else {
+                    Transport::NetherNetHttps
+                }
+            }
         }
     }
 }
@@ -212,6 +225,11 @@ pub struct NetherNetDetails {
     pub transport_layer: Option<u32>,
     /// Connection id (`connection`), when reported.
     pub connection: Option<u32>,
+    /// Whether the response was fetched over plain HTTP.
+    ///
+    /// Only `true` when the insecure-HTTP policy was enabled and the plain
+    /// HTTP endpoint answered; HTTPS responses report `false`.
+    pub insecure_http: bool,
 }
 
 /// Unified result of a successful query.
@@ -252,11 +270,16 @@ impl Status {
 
     /// Build a [`Status`] from raw protocol details, extracting the normalized
     /// `motd`, players, and version fields.
+    ///
+    /// The Java edition builds its `Status` directly in the query path (one
+    /// typed parse), so this constructor only handles Bedrock details.
+    #[cfg(feature = "bedrock")]
     pub(crate) fn from_details(address: ServerAddress, details: Details) -> Self {
+        // The Java edition builds its `Status` directly in the query path
+        // (one typed parse), so only Bedrock details flow through here.
         let (motd, players, version) = match &details {
             #[cfg(feature = "java")]
-            Details::Java(details) => crate::java::extract_java_fields(&details.raw_json),
-            #[cfg(feature = "bedrock")]
+            Details::Java(_) => unreachable!("Java builds its Status directly in query_socket"),
             Details::Bedrock(BedrockDetails::RakNet(details)) => (
                 details.motd_line_1.clone(),
                 Players {

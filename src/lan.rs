@@ -29,6 +29,8 @@ pub const VANILLA_PORT: u16 = 19_132;
 
 /// Default LAN discovery listen window.
 const DEFAULT_LISTEN_DURATION: Duration = Duration::from_millis(1_500);
+/// Default cap on discovered servers.
+const DEFAULT_MAX_RESULTS: usize = 32;
 
 /// Options for LAN discovery broadcasts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +42,8 @@ pub struct DiscoveryOptions {
     pub broadcast_addr: IpAddr,
     /// How long pong replies are collected before returning.
     pub listen_duration: Duration,
+    /// Upper bound on the number of servers returned.
+    pub max_results: usize,
 }
 
 impl Default for DiscoveryOptions {
@@ -48,6 +52,7 @@ impl Default for DiscoveryOptions {
             broadcast_port: DEFAULT_PORT,
             broadcast_addr: IpAddr::V4(Ipv4Addr::BROADCAST),
             listen_duration: DEFAULT_LISTEN_DURATION,
+            max_results: DEFAULT_MAX_RESULTS,
         }
     }
 }
@@ -71,6 +76,13 @@ impl DiscoveryOptions {
     #[must_use]
     pub fn listen_duration(mut self, duration: Duration) -> Self {
         self.listen_duration = duration;
+        self
+    }
+
+    /// Set the upper bound on the number of servers returned.
+    #[must_use]
+    pub fn max_results(mut self, max_results: usize) -> Self {
+        self.max_results = max_results;
         self
     }
 }
@@ -120,9 +132,10 @@ pub async fn discover(options: DiscoveryOptions) -> Result<Vec<LanServer>> {
 
     let socket = bind_lan_socket(options.broadcast_port)?;
     let target = SocketAddr::from((broadcast, options.broadcast_port));
-    socket.send_to(&codec::encode_ping(), target).await?;
+    let ping = codec::encode_ping();
+    socket.send_to(&ping, target).await?;
 
-    collect_pongs(socket, options.listen_duration).await
+    collect_pongs(socket, &ping, options.listen_duration, options.max_results).await
 }
 
 /// Bind a broadcast-capable IPv4 UDP socket on the given port.
@@ -140,13 +153,22 @@ fn bind_lan_socket(port: u16) -> Result<UdpSocket, Error> {
 
 async fn collect_pongs(
     socket: UdpSocket,
+    ping: &[u8],
     listen_duration: Duration,
+    max_results: usize,
 ) -> Result<Vec<LanServer>, Error> {
-    let deadline = Instant::now() + listen_duration;
-    let mut servers: HashMap<IpAddr, LanServer> = HashMap::new();
+    let deadline = Instant::now()
+        .checked_add(listen_duration)
+        .ok_or(Error::InvalidInput("listen duration is too large"))?;
+    // One entry per replying socket address, so multiple servers on one host
+    // are all reported.
+    let mut servers: HashMap<SocketAddr, LanServer> = HashMap::new();
     let mut buffer = [0_u8; 2048];
 
     loop {
+        if servers.len() >= max_results {
+            break;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
@@ -158,11 +180,16 @@ async fn collect_pongs(
                 if len == 0 {
                     continue;
                 }
+                // Correlate the pong with our ping timestamp to ignore stale
+                // or foreign replies.
+                if buffer.len() < 9 || buffer[1..9] != ping[1..9] {
+                    continue;
+                }
                 let Ok(details) = codec::decode_pong(&buffer[..len]).map(|motd| motd.to_owned())
                 else {
                     continue;
                 };
-                servers.insert(source.ip(), LanServer { source, details });
+                servers.insert(source, LanServer { source, details });
             }
         }
     }
@@ -208,11 +235,12 @@ mod tests {
         assert!(matches!(error, Error::InvalidInput(_)));
     }
 
-    /// Build a `RakNet` unconnected pong packet carrying the MOTD text.
-    fn build_pong(text: &str) -> Vec<u8> {
+    /// Build a `RakNet` unconnected pong packet carrying the MOTD text and
+    /// echoing the ping timestamp so the correlation check accepts it.
+    fn build_pong(ping_time: [u8; 8], text: &str) -> Vec<u8> {
         let mut packet = Vec::with_capacity(35 + text.len());
         packet.push(0x1c);
-        packet.extend_from_slice(&1_i64.to_be_bytes());
+        packet.extend_from_slice(&ping_time);
         packet.extend_from_slice(&2_i64.to_be_bytes());
         packet.extend_from_slice(&[
             0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34,
@@ -240,6 +268,8 @@ mod tests {
                 .port(),
         ));
 
+        let ping = codec::encode_ping();
+        let echo = ping[1..9].to_vec();
         let responder = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("responder should bind");
@@ -247,6 +277,7 @@ mod tests {
             let _ = responder
                 .send_to(
                     &build_pong(
+                        echo.clone().try_into().expect("8 bytes"),
                         "MCPE;LAN Server;589;1.21.100;3;20;1;Line2;Survival;1;19132;19133;",
                     ),
                     listen_address,
@@ -256,14 +287,14 @@ mod tests {
             let _ = responder
                 .send_to(
                     &build_pong(
+                        echo.try_into().expect("8 bytes"),
                         "MCPE;LAN Server v2;589;1.21.100;4;20;1;Line2;Survival;1;19132;19133;",
                     ),
                     listen_address,
                 )
                 .await;
         });
-
-        let servers = collect_pongs(listener, Duration::from_millis(300))
+        let servers = collect_pongs(listener, &ping, Duration::from_millis(300), 32)
             .await
             .expect("collection should succeed");
 
@@ -297,10 +328,18 @@ mod tests {
             // Platform does not expose multi-address loopback.
             return;
         };
+        let ping = codec::encode_ping();
+        let first_echo = ping[1..9].to_vec();
+        let second_echo = first_echo.clone();
+        let first = first;
+        let second = second;
         tokio::spawn(async move {
             let _ = first
                 .send_to(
-                    &build_pong("MCPE;First;589;1.21.100;1;20;1;Line2;Survival;1;19132;19133;"),
+                    &build_pong(
+                        first_echo.try_into().expect("8 bytes"),
+                        "MCPE;First;589;1.21.100;1;20;1;Line2;Survival;1;19132;19133;",
+                    ),
                     listen_address,
                 )
                 .await;
@@ -308,13 +347,16 @@ mod tests {
         tokio::spawn(async move {
             let _ = second
                 .send_to(
-                    &build_pong("MCPE;Second;589;1.21.100;2;20;2;Line2;Survival;1;19133;19134;"),
+                    &build_pong(
+                        second_echo.try_into().expect("8 bytes"),
+                        "MCPE;Second;589;1.21.100;2;20;2;Line2;Survival;1;19133;19134;",
+                    ),
                     listen_address,
                 )
                 .await;
         });
 
-        let servers = collect_pongs(listener, Duration::from_millis(300))
+        let servers = collect_pongs(listener, &ping, Duration::from_millis(300), 32)
             .await
             .expect("collection should succeed");
 
@@ -329,7 +371,8 @@ mod tests {
     async fn collect_pongs_returns_empty_without_replies() {
         let listener = bind_lan_socket(0).expect("listener should bind");
 
-        let servers = collect_pongs(listener, Duration::from_millis(50))
+        let ping = codec::encode_ping();
+        let servers = collect_pongs(listener, &ping, Duration::from_millis(50), 32)
             .await
             .expect("collection should succeed");
 
