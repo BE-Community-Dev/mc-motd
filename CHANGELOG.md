@@ -67,9 +67,23 @@ All notable changes to this project will be documented in this file.
     their own budget layer
   - RakNet lazy-resolution path no longer allocates an unused 2048-byte
     buffer; Java description flattening appends into one string; HTTP body
-    reserve uses a validated Content-Length
-  - cache keys are built with one allocation; `Cow` docs now note that
+    reserve is capped at `min(Content-Length, 4 KiB)` and grows as data
+    arrives instead of trusting the remote hint
+  - `TransportCache` keys are a true single allocation (in-place ASCII
+    lowercasing plus `fmt::Write` for the port); `Cow` docs now note that
     escaped JSON strings still allocate
+  - the singleflight key is built from the parsed target ports, the
+    explicit-port flag, and the timeout, so same-host/different-port queries
+    can never merge or return each other's status
+  - singleflight uses a `watch` channel instead of `Notify`, so a shared probe
+    that completes before a waiter starts waiting is still observed; only the
+    owning task removes the map entry (guarded by `Arc::ptr_eq`) and waiters
+    share failures instead of re-probing
+  - `max_in_flight` is acquired at every engine entry point with exactly one
+    permit per logical query; the nested `full -> bedrock -> raknet` layers
+    reuse it, and zero or out-of-range limits are rejected at build time
+  - Java SRV lookup returns a typed outcome (`Targets` / `NoRecords` /
+    `Unavailable`) instead of inspecting error message text
 - Contract fixes from review: an explicitly specified port skips SRV entirely;
   `Status.address` keeps the requested address (including explicit ports)
   untouched while SRV targets surface through `JavaDetails::srv`; status
@@ -83,14 +97,14 @@ All notable changes to this project will be documented in this file.
   semicolons is borrowed as one contiguous span instead of being re-joined;
   Java description parsing flattens nested text components (`extra`,
   `translate`).
-
-### Added
-
-- Optional `ClientBuilder::merge_in_flight(true)` merges concurrent identical
-  queries into one shared probe (each waiter keeps its own deadline and
-  cancellation semantics); `max_in_flight(n)` bounds concurrent probes.
-- Regression tests for the HTTP cache policy guard, in-flight merging, and
-  concurrency limits.
+- Optional concurrency control: `ClientBuilder::merge_in_flight(true)` merges
+  concurrent identical queries into one shared probe — every caller receives
+  the shared result, including a shared failure, without re-probing — and
+  `max_in_flight(n)` bounds the number of logical queries running at once with
+  one permit per query.
+- Regression tests for the HTTP cache policy guard, singleflight identity,
+  port-aware flight keys, shared failures, caller cancellation, and the
+  in-flight limit.
 
 ### Changed
 
@@ -113,6 +127,9 @@ All notable changes to this project will be documented in this file.
   timeout.
 - **Breaking:** the transport cache moved from a process global into
   `Client` instances.
+- `Error` and `Attempt` implement `Clone`, so a shared singleflight failure can
+  be handed to every waiter without re-running the probe. Cloning an
+  `Error::Io` rebuilds it from its kind and message.
 
 ## 0.1.0 - Unreleased
 

@@ -64,7 +64,7 @@ pub enum Error {
 
 /// One failed probe inside an aggregate [`Error::NoCompatibleServer`]-style
 /// error, keeping the original error for `source()` traversal.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Attempt {
     /// Transport that was probed.
@@ -73,6 +73,53 @@ pub struct Attempt {
     pub target: String,
     /// The underlying failure.
     pub error: Box<Error>,
+}
+
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        match self {
+            Self::ResolveFailed => Self::ResolveFailed,
+            // `std::io::Error` is not `Clone`; rebuilding it from its kind
+            // and message preserves both the error kind and the display text.
+            Self::Io(error) => Self::Io(std::io::Error::new(error.kind(), error.to_string())),
+            Self::Timeout => Self::Timeout,
+            Self::Dns(message) => Self::Dns(message.clone()),
+            Self::InvalidInput(message) => Self::InvalidInput(message),
+            Self::InvalidPacket(message) => Self::InvalidPacket(message),
+            Self::InvalidUtf8(error) => Self::InvalidUtf8(*error),
+            Self::HttpStatus(status) => Self::HttpStatus(*status),
+            Self::Http(message) => Self::Http(message.clone()),
+            Self::NoCompatibleServer {
+                host,
+                java_port,
+                bedrock_port,
+                attempts,
+            } => Self::NoCompatibleServer {
+                host: host.clone(),
+                java_port: *java_port,
+                bedrock_port: *bedrock_port,
+                attempts: attempts.clone(),
+            },
+            Self::NoCompatibleJavaServer {
+                host,
+                java_port,
+                attempts,
+            } => Self::NoCompatibleJavaServer {
+                host: host.clone(),
+                java_port: *java_port,
+                attempts: attempts.clone(),
+            },
+            Self::NoCompatibleBedrockServer {
+                host,
+                bedrock_port,
+                attempts,
+            } => Self::NoCompatibleBedrockServer {
+                host: host.clone(),
+                bedrock_port: *bedrock_port,
+                attempts: attempts.clone(),
+            },
+        }
+    }
 }
 
 impl fmt::Display for Attempt {

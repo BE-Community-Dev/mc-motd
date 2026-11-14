@@ -42,13 +42,19 @@ impl TransportCache {
 
     /// Build the cache key for a Bedrock server endpoint.
     ///
-    /// One allocation: the lowercased host and the port are appended into a
-    /// single pre-sized string.
+    /// One allocation: the ASCII-lowercased host and the port are appended
+    /// into a single pre-sized string, with no intermediate `String` for
+    /// either part.
     fn cache_key(host: &str, port: u16) -> String {
-        let mut key = String::with_capacity(host.len() + 8);
-        key.push_str(&host.to_ascii_lowercase());
+        use std::fmt::Write as _;
+
+        let mut key = String::with_capacity(host.len() + 6);
+        // `to_ascii_lowercase` leaves non-ASCII characters untouched, matching
+        // `str::to_ascii_lowercase` without allocating.
+        key.extend(host.chars().map(|character| character.to_ascii_lowercase()));
         key.push(':');
-        key.push_str(&port.to_string());
+        // Writing to a `String` cannot fail.
+        let _ = write!(key, "{port}");
         key
     }
 

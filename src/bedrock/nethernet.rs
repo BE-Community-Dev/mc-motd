@@ -24,6 +24,12 @@ const JOIN_PATH: &str = "/v1/join";
 const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default response body cap for `NetherNet` join responses (64 KiB).
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+/// Upper bound for the initial body reservation.
+///
+/// `Content-Length` is a remote hint, not a promise: reserving the full
+/// advertised size would let many small or lying responses inflate peak
+/// memory. The buffer starts at most this large and grows as data arrives.
+const BODY_RESERVE_HINT: usize = 4 * 1024;
 
 /// Process-wide shared HTTP client used by the default [`crate::Client`].
 static SHARED_HTTP: OnceLock<std::result::Result<reqwest::Client, String>> = OnceLock::new();
@@ -291,14 +297,16 @@ async fn fetch_join(
         ));
     }
 
-    // Reserve based on a validated Content-Length when available so large
-    // responses do not repeatedly reallocate the buffer.
-    let mut body = Vec::with_capacity(
-        response
-            .content_length()
-            .filter(|length| *length <= max_response_bytes as u64)
-            .map_or(1024, |length| usize::try_from(length).unwrap_or(1024)),
-    );
+    // Reserve a bounded amount up front: a validated Content-Length is a
+    // useful hint for normal servers, but it never justifies reserving more
+    // than `BODY_RESERVE_HINT` (or the configured cap) before any byte
+    // arrives.
+    let reserve = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .map_or(BODY_RESERVE_HINT, |length| length.min(BODY_RESERVE_HINT))
+        .min(max_response_bytes);
+    let mut body = Vec::with_capacity(reserve);
     while let Some(chunk) = response
         .chunk()
         .await

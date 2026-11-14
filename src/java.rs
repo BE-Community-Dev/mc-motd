@@ -76,6 +76,20 @@ pub async fn resolve_srv(host: impl AsRef<str>, timeout: Duration) -> Result<Vec
     resolve_srv_with(&resolver, host, timeout).await
 }
 
+/// Typed outcome of an SRV lookup.
+///
+/// Control flow never inspects error message text: an authoritative
+/// "service unavailable" answer is a distinct outcome, not a DNS failure.
+pub(crate) enum SrvLookup {
+    /// Usable targets, already ordered per RFC 2782.
+    Targets(Vec<SrvTarget>),
+    /// The host has no SRV records, or SRV does not apply to it.
+    NoRecords,
+    /// The records authoritatively mark the service as unavailable (`.` target
+    /// or port 0).
+    Unavailable,
+}
+
 /// Resolve SRV records with a caller-supplied resolver so client queries
 /// reuse one resolver per client instead of rebuilding it per query.
 pub(crate) async fn resolve_srv_with(
@@ -83,9 +97,30 @@ pub(crate) async fn resolve_srv_with(
     host: impl AsRef<str>,
     timeout: Duration,
 ) -> Result<Vec<SrvTarget>> {
-    let host = address::normalize_server_host(host.as_ref())?;
+    match lookup_srv(resolver, host.as_ref(), timeout).await? {
+        SrvLookup::Targets(targets) => Ok(targets),
+        SrvLookup::NoRecords => Ok(Vec::new()),
+        SrvLookup::Unavailable => Err(Error::Dns(
+            "SRV records mark the service as unavailable".into(),
+        )),
+    }
+}
+
+/// Look up SRV records and classify the outcome.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidInput`] if the host is invalid, [`Error::Timeout`]
+/// if the lookup exceeds `timeout`, and [`Error::Dns`] if the resolver
+/// reports a lookup failure.
+pub(crate) async fn lookup_srv(
+    resolver: &hickory_resolver::TokioResolver,
+    host: &str,
+    timeout: Duration,
+) -> Result<SrvLookup> {
+    let host = address::normalize_server_host(host)?;
     if !address::can_query_srv(host.as_ref()) {
-        return Ok(Vec::new());
+        return Ok(SrvLookup::NoRecords);
     }
 
     let name = address::minecraft_srv_name(host.as_ref());
@@ -108,7 +143,7 @@ pub(crate) async fn resolve_srv_with(
         })
         .collect::<Vec<_>>();
     if records.is_empty() {
-        return Ok(Vec::new());
+        return Ok(SrvLookup::NoRecords);
     }
     // RFC 2782: a "." target or port 0 means the service is decidedly
     // unavailable — that is an authoritative answer, not a fallback signal.
@@ -116,15 +151,13 @@ pub(crate) async fn resolve_srv_with(
         .iter()
         .all(|target| target.host.is_empty() || target.port == 0)
     {
-        return Err(Error::Dns(
-            "SRV records mark the service as unavailable".into(),
-        ));
+        return Ok(SrvLookup::Unavailable);
     }
     let usable = records
         .into_iter()
         .filter(|target| !target.host.is_empty() && target.port != 0)
         .collect::<Vec<_>>();
-    Ok(weighted_srv_order(usable))
+    Ok(SrvLookup::Targets(weighted_srv_order(usable)))
 }
 
 /// Order SRV records by priority with RFC 2782 weighted-random selection
@@ -204,8 +237,8 @@ pub(crate) async fn run(
         // Cap the SRV budget so a slow SRV path cannot starve direct probes.
         let srv_budget =
             crate::client::engine::remaining(deadline)?.min(crate::client::SRV_LOOKUP_BUDGET);
-        match resolve_srv_with(srv_resolver, &address.host, srv_budget).await {
-            Ok(targets) if !targets.is_empty() => {
+        match lookup_srv(srv_resolver, &address.host, srv_budget).await {
+            Ok(SrvLookup::Targets(targets)) => {
                 return probe_srv_sequence(address, &targets, resolved, deadline)
                     .await
                     .map_err(|attempts| Error::NoCompatibleJavaServer {
@@ -214,18 +247,20 @@ pub(crate) async fn run(
                         attempts,
                     });
             }
-            Ok(_) => prefix_attempts.push(Attempt {
+            Ok(SrvLookup::NoRecords) => prefix_attempts.push(Attempt {
                 transport: Transport::JavaTcp,
                 target: address.host.clone(),
                 error: Box::new(Error::Dns("no SRV records found".to_string())),
             }),
             // SRV records pointing at "." are an authoritative "service
             // unavailable": do not silently fall back to direct probing.
-            Err(error @ Error::Dns(_)) if error.to_string().contains("unavailable") => {
+            Ok(SrvLookup::Unavailable) => {
                 prefix_attempts.push(Attempt {
                     transport: Transport::JavaTcp,
                     target: address.host.clone(),
-                    error: Box::new(error),
+                    error: Box::new(Error::Dns(
+                        "SRV records mark the service as unavailable".to_string(),
+                    )),
                 });
                 return Err(Error::NoCompatibleJavaServer {
                     host: address.host.clone(),
