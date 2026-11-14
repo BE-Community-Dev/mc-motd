@@ -223,6 +223,10 @@ struct ClientInner {
     pub(crate) resolver: SrvResolver,
     /// Bounds the number of probes running concurrently across this client.
     in_flight: Arc<tokio::sync::Semaphore>,
+    /// Bounds the number of distinct merged flights queued or running. A slot
+    /// is held from flight creation until its shared probe finishes, so a
+    /// scan of many targets cannot accumulate unbounded detached tasks.
+    queued: Arc<tokio::sync::Semaphore>,
     /// Merges concurrent identical queries into one shared probe when
     /// `merge_in_flight` was enabled on the builder.
     flights: Arc<Mutex<HashMap<String, Arc<Flight>>>>,
@@ -477,6 +481,7 @@ pub struct ClientBuilder {
     cache_capacity: usize,
     merge_in_flight: bool,
     max_in_flight: Option<usize>,
+    max_queued: Option<usize>,
 }
 
 #[allow(clippy::derivable_impls)] // not derivable when the bedrock feature adds cache_capacity
@@ -488,6 +493,7 @@ impl Default for ClientBuilder {
             cache_capacity: DEFAULT_CACHE_CAPACITY,
             merge_in_flight: false,
             max_in_flight: None,
+            max_queued: None,
         }
     }
 }
@@ -559,6 +565,14 @@ impl ClientBuilder {
     /// turn one merged probe into a request storm. Every caller still stops
     /// at its own deadline.
     ///
+    /// A caller that joins an existing flight shares the probe that is
+    /// currently running; it does not get a fresh full timeout window. Its
+    /// result still arrives before its own deadline because the shared probe's
+    /// absolute deadline was fixed earlier.
+    ///
+    /// Use [`ClientBuilder::max_queued`] to bound how many distinct flights
+    /// (and their detached tasks) may exist at once.
+    ///
     /// Defaults to disabled.
     #[must_use]
     pub fn merge_in_flight(mut self, merge: bool) -> Self {
@@ -585,14 +599,39 @@ impl ClientBuilder {
         self
     }
 
+    /// Bound the number of distinct merged flights queued or running.
+    ///
+    /// Only used when [`ClientBuilder::merge_in_flight`] is enabled. A flight
+    /// holds one slot from creation until its shared probe finishes, so a
+    /// client that scans many different targets cannot accumulate unbounded
+    /// detached probe tasks and flight entries. Callers waiting on an existing
+    /// flight do not consume a slot; a caller waiting for a free slot is
+    /// bounded by its own query deadline.
+    ///
+    /// This is separate from [`ClientBuilder::max_in_flight`]: the queue bound
+    /// limits how many probes may exist, the in-flight bound limits how many
+    /// may execute network I/O at once.
+    ///
+    /// `None` (the default) leaves the queue unbounded.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientBuilder::build`] rejects `0` and values above
+    /// [`tokio::sync::Semaphore::MAX_PERMITS`].
+    #[must_use]
+    pub fn max_queued(mut self, max_queued: usize) -> Self {
+        self.max_queued = Some(max_queued);
+        self
+    }
+
     /// Build the client.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::Error::InvalidInput`] when `max_in_flight` is
-    /// zero or exceeds [`tokio::sync::Semaphore::MAX_PERMITS`], and
-    /// [`crate::error::Error::Http`] when the `NetherNet` HTTP client cannot
-    /// be constructed, instead of silently substituting a differently
+    /// Returns [`crate::error::Error::InvalidInput`] when `max_in_flight` or
+    /// `max_queued` is zero or exceeds [`tokio::sync::Semaphore::MAX_PERMITS`],
+    /// and [`crate::error::Error::Http`] when the `NetherNet` HTTP client
+    /// cannot be constructed, instead of silently substituting a differently
     /// configured client.
     pub fn build(self) -> std::result::Result<Client, crate::error::Error> {
         if let Some(limit) = self.max_in_flight {
@@ -604,6 +643,16 @@ impl ClientBuilder {
             if limit > tokio::sync::Semaphore::MAX_PERMITS {
                 return Err(Error::InvalidInput(
                     "max_in_flight exceeds the semaphore limit",
+                ));
+            }
+        }
+        if let Some(limit) = self.max_queued {
+            if limit == 0 {
+                return Err(Error::InvalidInput("max_queued must be greater than zero"));
+            }
+            if limit > tokio::sync::Semaphore::MAX_PERMITS {
+                return Err(Error::InvalidInput(
+                    "max_queued exceeds the semaphore limit",
                 ));
             }
         }
@@ -621,6 +670,10 @@ impl ClientBuilder {
                 resolver,
                 in_flight: Arc::new(tokio::sync::Semaphore::new(
                     self.max_in_flight
+                        .unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
+                )),
+                queued: Arc::new(tokio::sync::Semaphore::new(
+                    self.max_queued
                         .unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
                 )),
                 flights: Arc::new(Mutex::new(HashMap::new())),
@@ -697,28 +750,37 @@ pub(crate) struct Flight {
     /// value, so a caller that subscribes after the probe finished still sees
     /// the result instead of waiting for a notification that already fired.
     outcome: tokio::sync::watch::Sender<Option<Arc<Result<Status, Error>>>>,
-    /// Whether a caller has claimed ownership of running the probe.
-    claimed: std::sync::atomic::AtomicBool,
 }
 
 impl Flight {
     fn new() -> Self {
         let (outcome, _receiver) = tokio::sync::watch::channel(None);
-        Self {
-            outcome,
-            claimed: std::sync::atomic::AtomicBool::new(false),
-        }
+        Self { outcome }
     }
+}
+
+/// How a caller entered the merged path.
+enum Admission {
+    /// The flight already existed; wait for its outcome.
+    Joined(Arc<Flight>),
+    /// This caller created the flight and owns the shared probe.
+    Created(Arc<Flight>, tokio::sync::OwnedSemaphorePermit),
 }
 
 impl Client {
     /// Run a full query merged with concurrent identical callers.
     ///
-    /// The first caller spawns the shared probe, so its own cancellation
-    /// cannot cancel the probe for the others. Every caller — the owner
-    /// included — waits for the shared outcome within its own deadline.
-    /// Failures are shared too: a waiter never re-probes, so an unreachable
-    /// server cannot turn one merged probe into a request storm.
+    /// The creator of a flight runs the shared probe in a detached task, so
+    /// its own cancellation cannot cancel the probe for the others. Every
+    /// caller — the creator included — waits for the shared outcome within its
+    /// own deadline.
+    ///
+    /// A merged caller shares the probe that is *currently* running, not a
+    /// fresh full timeout window: a late joiner receives the shared result as
+    /// soon as it lands, which is always before its own deadline because the
+    /// shared probe's absolute deadline was fixed earlier. Failures are shared
+    /// too: a waiter never re-probes, so an unreachable server cannot turn one
+    /// merged probe into a request storm.
     async fn merged_probe(
         &self,
         key: &str,
@@ -727,27 +789,21 @@ impl Client {
         address: &ServerAddress,
         resolved: &ResolvedOptions,
     ) -> Result<Status, Error> {
-        use std::sync::atomic::Ordering;
-
-        let entry = {
-            let mut flights = self.inner.flights.lock().expect("flights lock poisoned");
-            flights
-                .entry(key.to_string())
-                .or_insert_with(|| Arc::new(Flight::new()))
-                .clone()
+        let admission = self.admit(key, deadline).await?;
+        let flight = match &admission {
+            Admission::Joined(flight) | Admission::Created(flight, _) => Arc::clone(flight),
         };
 
         // Subscribe before reading the outcome: `watch` retains the latest
         // value, so a result that lands between these two steps is still
         // observed instead of being lost.
-        let mut outcome = entry.outcome.subscribe();
+        let mut outcome = flight.outcome.subscribe();
 
-        if !entry.claimed.swap(true, Ordering::SeqCst) {
-            // Owner: run the probe in a detached task so this caller's
-            // cancellation cannot abort it for the other waiters. Only this
-            // task removes the map entry, and only while the entry still
-            // points at this flight.
-            let probe_entry = Arc::clone(&entry);
+        if let Admission::Created(entry, permit) = admission {
+            // Creator: run the probe in a detached task so this caller's
+            // cancellation cannot abort it for the other waiters. The guard
+            // cleans the map entry and publishes a failure even if the task
+            // panics; the permit bounds how many flights may exist at once.
             let probe_flights = Arc::clone(&self.inner.flights);
             let probe_key = key.to_string();
             let parts = self.parts();
@@ -758,6 +814,8 @@ impl Client {
             #[allow(clippy::let_unit_value, clippy::clone_on_copy)]
             let srv_resolver = self.srv_resolver().clone();
             tokio::spawn(async move {
+                let _queue_permit = permit;
+                let guard = FlightGuard::new(probe_flights, probe_key, Arc::clone(&entry));
                 let shared = Arc::new(
                     engine::full_with_deadline(
                         &parts,
@@ -769,17 +827,123 @@ impl Client {
                     )
                     .await,
                 );
-                remove_flight_if_current(&probe_flights, &probe_key, &probe_entry);
-                probe_entry.outcome.send_replace(Some(shared));
+                guard.complete(shared);
             });
         }
 
         match wait_for_flight(&mut outcome, deadline).await? {
             Some(shared) => settle(shared.as_ref(), started),
-            None => Err(Error::Io(std::io::Error::other(
+            None => Err(Error::Io(Arc::new(std::io::Error::other(
                 "shared query task ended without a result",
-            ))),
+            )))),
         }
+    }
+
+    /// Join the flight for `key`, creating it when absent.
+    ///
+    /// Creating a flight first acquires a queue slot, so the number of live
+    /// flights (and their detached tasks) is bounded by `max_queued`. The map
+    /// is re-checked after waiting for a slot: another caller may have created
+    /// the same flight meanwhile, in which case this caller joins it and the
+    /// slot is released immediately.
+    async fn admit(&self, key: &str, deadline: Instant) -> Result<Admission, Error> {
+        if let Some(existing) = self
+            .inner
+            .flights
+            .lock()
+            .expect("flights lock poisoned")
+            .get(key)
+        {
+            return Ok(Admission::Joined(Arc::clone(existing)));
+        }
+
+        let permit = acquire_queue_slot(&self.inner.queued, deadline).await?;
+        let mut flights = self.inner.flights.lock().expect("flights lock poisoned");
+        if let Some(existing) = flights.get(key) {
+            // Another caller created this flight while we waited for a slot.
+            // Dropping `permit` at the end of this block releases the slot.
+            return Ok(Admission::Joined(Arc::clone(existing)));
+        }
+        let entry = Arc::new(Flight::new());
+        flights.insert(key.to_string(), Arc::clone(&entry));
+        Ok(Admission::Created(entry, permit))
+    }
+}
+
+/// Acquire one merged-flight slot, waiting no longer than `deadline`.
+async fn acquire_queue_slot(
+    queued: &Arc<tokio::sync::Semaphore>,
+    deadline: Instant,
+) -> Result<tokio::sync::OwnedSemaphorePermit, Error> {
+    let permit = time::timeout(
+        engine::remaining(deadline)?,
+        Arc::clone(queued).acquire_owned(),
+    )
+    .await
+    .map_err(|_| Error::Timeout)?;
+    permit.map_err(|_| {
+        // Unreachable while the client holds the semaphore open, but the
+        // closed case must surface as an error, never a panic.
+        Error::Io(Arc::new(std::io::Error::other(
+            "client queue limiter closed",
+        )))
+    })
+}
+
+/// Cleans up a flight if its shared task exits without publishing a result.
+///
+/// The normal path calls [`FlightGuard::complete`], which disarms the guard.
+/// If the task panics or is aborted first, `Drop` removes the map entry and
+/// publishes a failure, so the key cannot stay wedged behind a flight that
+/// nobody owns.
+struct FlightGuard {
+    flights: Arc<Mutex<HashMap<String, Arc<Flight>>>>,
+    key: String,
+    entry: Arc<Flight>,
+    armed: bool,
+}
+
+impl FlightGuard {
+    fn new(
+        flights: Arc<Mutex<HashMap<String, Arc<Flight>>>>,
+        key: String,
+        entry: Arc<Flight>,
+    ) -> Self {
+        Self {
+            flights,
+            key,
+            entry,
+            armed: true,
+        }
+    }
+
+    /// Publish the outcome, remove the flight, and disarm the panic path.
+    fn complete(mut self, shared: Arc<Result<Status, Error>>) {
+        self.armed = false;
+        remove_flight_if_current(&self.flights, &self.key, &self.entry);
+        self.entry.outcome.send_replace(Some(shared));
+    }
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Best effort: a poisoned map is already unusable, and panicking in
+        // `drop` during unwinding would abort the process.
+        if let Ok(mut flights) = self.flights.lock()
+            && flights
+                .get(&self.key)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.entry))
+        {
+            flights.remove(&self.key);
+        }
+        self.entry
+            .outcome
+            .send_replace(Some(Arc::new(Err(Error::Io(Arc::new(
+                std::io::Error::other("shared query task panicked"),
+            ))))));
     }
 }
 
@@ -921,7 +1085,9 @@ pub(crate) mod engine {
         permit.map_err(|_| {
             // Unreachable while `Parts` holds the semaphore open, but the
             // closed case must still surface as an error, never a panic.
-            Error::Io(std::io::Error::other("client concurrency limiter closed"))
+            Error::Io(Arc::new(std::io::Error::other(
+                "client concurrency limiter closed",
+            )))
         })
     }
 
@@ -1880,6 +2046,166 @@ mod concurrency_tests {
                 .expect("flights lock poisoned")
                 .is_empty(),
             "completed flights must not accumulate in the map"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_joiners_share_the_current_probe() {
+        // The first caller starts the shared probe; the second joins 60 ms
+        // later with the same options. It must receive the shared result
+        // instead of starting a second probe, and stay inside its deadline.
+        let mock = spawn_mock(MOCK_MOTD_TEXT, Duration::from_millis(120), true).await;
+        let address = format!("{}:{}", mock.address.ip(), mock.address.port());
+        let client = Client::builder()
+            .merge_in_flight(true)
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("test client should build");
+
+        let first = {
+            let client = client.clone();
+            let address = address.clone();
+            tokio::spawn(async move {
+                client
+                    .query_with(address, QueryOptions::default().edition(Edition::Bedrock))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let second = {
+            let client = client.clone();
+            let address = address.clone();
+            tokio::spawn(async move {
+                let started = Instant::now();
+                let result = client
+                    .query_with(address, QueryOptions::default().edition(Edition::Bedrock))
+                    .await;
+                (started.elapsed(), result)
+            })
+        };
+
+        let a = first
+            .await
+            .expect("task should finish")
+            .expect("first query should answer");
+        let (second_elapsed, b) = second.await.expect("task should finish");
+        assert_eq!(a.motd, "RakNet Mock");
+        assert_eq!(
+            b.expect("the late joiner should answer").motd,
+            "RakNet Mock"
+        );
+        assert!(
+            second_elapsed < Duration::from_secs(1),
+            "the late joiner must not restart the probe: {second_elapsed:?}"
+        );
+        assert_eq!(
+            mock.pings.load(Ordering::SeqCst),
+            1,
+            "a late joiner must not add a probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_queued_bounds_live_flights() {
+        // Ten distinct keys targeting the same server. With one queue slot
+        // only one flight may exist at a time; the others wait for the slot
+        // and run afterwards instead of accumulating detached tasks.
+        let mock = spawn_mock(MOCK_MOTD_TEXT, Duration::from_millis(20), true).await;
+        let address = format!("{}:{}", mock.address.ip(), mock.address.port());
+        let client = Client::builder()
+            .merge_in_flight(true)
+            .max_queued(1)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("test client should build");
+
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let watching = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let watcher = {
+            let flights = Arc::clone(&client.inner.flights);
+            let max_seen = Arc::clone(&max_seen);
+            let watching = Arc::clone(&watching);
+            tokio::spawn(async move {
+                while watching.load(Ordering::SeqCst) {
+                    let live = flights.lock().expect("flights lock poisoned").len();
+                    max_seen.fetch_max(live, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+        };
+
+        let mut tasks = Vec::new();
+        for index in 0..10_u32 {
+            let client = client.clone();
+            let address = address.clone();
+            // `max_response_bytes` is part of the flight key, so every caller
+            // asks for a distinct flight against the same endpoint.
+            let options = QueryOptions::default()
+                .edition(Edition::Bedrock)
+                .max_response_bytes(1024 + usize::try_from(index).expect("index fits"));
+            tasks.push(tokio::spawn(async move {
+                client.query_with(address, options).await
+            }));
+        }
+        for task in tasks {
+            let status = task
+                .await
+                .expect("task should finish")
+                .expect("queued query should answer");
+            assert_eq!(status.motd, "RakNet Mock");
+        }
+
+        watching.store(false, Ordering::SeqCst);
+        watcher.await.expect("watcher should finish");
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "max_queued(1) must keep at most one live flight"
+        );
+    }
+
+    #[test]
+    fn max_queued_rejects_zero() {
+        let error = Client::builder()
+            .max_queued(0)
+            .build()
+            .err()
+            .expect("zero must be rejected");
+
+        assert!(matches!(error, Error::InvalidInput(_)));
+    }
+
+    #[test]
+    fn panicking_shared_task_cleans_up_its_flight() {
+        // The guard is what protects the map when the detached probe task
+        // unwinds instead of publishing a result.
+        let flights = Arc::new(Mutex::new(HashMap::new()));
+        let entry = Arc::new(Flight::new());
+        flights
+            .lock()
+            .expect("flights lock poisoned")
+            .insert("panic-key".to_string(), Arc::clone(&entry));
+        let mut outcome = entry.outcome.subscribe();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let flights = Arc::clone(&flights);
+            let entry = Arc::clone(&entry);
+            move || {
+                let _guard = FlightGuard::new(flights, "panic-key".to_string(), entry);
+                panic!("simulated shared-probe panic");
+            }
+        }));
+        assert!(result.is_err(), "the closure should have panicked");
+
+        assert!(
+            flights.lock().expect("flights lock poisoned").is_empty(),
+            "a panicking shared task must remove its flight"
+        );
+        let published = outcome.borrow_and_update().clone();
+        let published = published.expect("a panic must publish an error outcome");
+        assert!(
+            matches!(published.as_ref(), Err(Error::Io(_))),
+            "the published outcome should be an I/O error"
         );
     }
 

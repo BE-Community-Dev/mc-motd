@@ -191,25 +191,33 @@ fn weighted_srv_order(mut records: Vec<SrvTarget>) -> Vec<SrvTarget> {
             .count();
         let mut group: Vec<SrvTarget> = records.drain(0..group_end).collect();
         while !group.is_empty() {
-            // RFC 2782: sum the weights of the records yet to be ordered and
-            // pick the record whose range covers a uniform random point in
-            // [0, Sum). Zero-weight records own an empty range and are only
-            // selected once nothing else remains.
-            let total: u64 = group.iter().map(|target| u64::from(target.weight)).sum();
-            let picked = if total == 0 {
-                0
-            } else {
-                let mut point = random() % total;
-                let mut index = group.len() - 1;
-                for (position, target) in group.iter().enumerate() {
-                    if u64::from(target.weight) > point {
-                        index = position;
-                        break;
-                    }
-                    point -= u64::from(target.weight);
+            // RFC 2782: zero-weight records are placed at the front of the
+            // list. Their relative order is arbitrary, so shuffle them: an
+            // all-zero group then still selects uniformly instead of always
+            // returning the first record.
+            group.sort_by_key(|target| target.weight != 0);
+            let zero_count = group.iter().take_while(|target| target.weight == 0).count();
+            if zero_count > 1 {
+                for index in (1..zero_count).rev() {
+                    let upper = u64::try_from(index + 1).unwrap_or(u64::MAX);
+                    let swap = usize::try_from(random() % upper).unwrap_or(0);
+                    group.swap(index, swap);
                 }
-                index
-            };
+            }
+
+            let total: u64 = group.iter().map(|target| u64::from(target.weight)).sum();
+            // RFC 2782 samples the inclusive range [0, sum], so a zero-weight
+            // record is selected when the random point is exactly zero.
+            let mut point = random() % total.saturating_add(1);
+            let mut picked = group.len() - 1;
+            for (position, target) in group.iter().enumerate() {
+                let weight = u64::from(target.weight);
+                if point <= weight {
+                    picked = position;
+                    break;
+                }
+                point -= weight;
+            }
             ordered.push(group.remove(picked));
         }
     }
@@ -563,31 +571,52 @@ pub(crate) struct JavaVersion {
 /// and `translate` fallbacks), and arrays of components. Anything else is
 /// rendered as its JSON form; there is no legacy color-code stripping.
 fn describe(value: &serde_json::Value) -> String {
+    let mut text = String::new();
+    append_description(value, &mut text);
+    text
+}
+
+/// Append one description component to `out`.
+///
+/// The whole recursive flattening shares one output buffer: array elements and
+/// `extra` children are appended directly instead of each building a temporary
+/// `String`.
+fn append_description(value: &serde_json::Value, out: &mut String) {
+    use std::fmt::Write as _;
+
     match value {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Array(components) => components.iter().map(describe).collect::<String>(),
+        serde_json::Value::String(text) => out.push_str(text),
+        serde_json::Value::Array(components) => {
+            for component in components {
+                append_description(component, out);
+            }
+        }
         serde_json::Value::Object(object) => {
-            let mut text = object
+            let text = object
                 .get("text")
                 .and_then(serde_json::Value::as_str)
-                .map_or_else(String::new, ToString::to_string);
-            if text.is_empty() {
-                text.push_str(
+                .filter(|text| !text.is_empty());
+            match text {
+                Some(text) => out.push_str(text),
+                None => out.push_str(
                     object
                         .get("translate")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default(),
-                );
+                ),
             }
             if let Some(extra) = object.get("extra").and_then(serde_json::Value::as_array) {
                 for component in extra {
-                    text.push_str(&describe(component));
+                    append_description(component, out);
                 }
             }
-            text
         }
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
+        serde_json::Value::Null => {}
+        other => {
+            // Numbers and booleans have no borrowed form; write them straight
+            // into the output buffer.
+            let _ = write!(out, "{other}");
+        }
     }
 }
 
@@ -636,45 +665,88 @@ mod tests {
         assert!(!srv_applicable(&address, &disabled));
     }
 
-    #[test]
-    fn weighted_srv_order_is_strict_rfc_2782() {
-        // A record with a large weight is always picked before zero-weight
-        // records, whose empty range only yields once nothing else remains.
-        let records = vec![
-            SrvTarget {
-                host: "heavy.example.com".into(),
-                port: 25_565,
-                priority: 0,
-                weight: 100,
-            },
-            SrvTarget {
-                host: "light.example.com".into(),
-                port: 25_565,
-                priority: 0,
-                weight: 0,
-            },
-        ];
-        let ordered = weighted_srv_order(records);
-        assert_eq!(ordered[0].host, "heavy.example.com");
+    /// Build a single-priority SRV target fixture.
+    fn srv(host: &str, weight: u16) -> SrvTarget {
+        SrvTarget {
+            host: host.into(),
+            port: 25_565,
+            priority: 0,
+            weight,
+        }
+    }
 
-        // All-zero weights keep a deterministic order.
-        let records = vec![
-            SrvTarget {
-                host: "a.example.com".into(),
-                port: 25_565,
-                priority: 0,
-                weight: 0,
-            },
-            SrvTarget {
-                host: "b.example.com".into(),
-                port: 25_565,
-                priority: 0,
-                weight: 0,
-            },
-        ];
-        let ordered = weighted_srv_order(records);
-        assert_eq!(ordered[0].host, "a.example.com");
-        assert_eq!(ordered[1].host, "b.example.com");
+    #[test]
+    fn weighted_srv_order_respects_rfc_2782_weights() {
+        // A heavy record dominates, but the inclusive [0, sum] draw gives the
+        // zero-weight record a small chance (1/101 here) instead of none.
+        let mut heavy_first = 0;
+        for _ in 0..1_000 {
+            let ordered = weighted_srv_order(vec![
+                srv("heavy.example.com", 100),
+                srv("light.example.com", 0),
+            ]);
+            assert_eq!(ordered.len(), 2, "every record must be ordered");
+            if ordered[0].host == "heavy.example.com" {
+                heavy_first += 1;
+            }
+        }
+        assert!(
+            heavy_first > 900,
+            "the weight-100 record should dominate, first {heavy_first}/1000 times"
+        );
+    }
+
+    #[test]
+    fn weighted_srv_order_gives_zero_weight_records_a_nonzero_chance() {
+        // RFC 2782 places zero-weight records first and samples [0, sum]
+        // inclusively, so a zero-weight record wins when the draw is zero.
+        let mut zero_first = 0;
+        for _ in 0..2_000 {
+            let ordered = weighted_srv_order(vec![
+                srv("zero.example.com", 0),
+                srv("a.example.com", 1),
+                srv("b.example.com", 1),
+            ]);
+            assert_eq!(ordered.len(), 3);
+            if ordered[0].host == "zero.example.com" {
+                zero_first += 1;
+            }
+        }
+        assert!(
+            zero_first > 200,
+            "zero-weight record was almost never selected: {zero_first}/2000"
+        );
+        assert!(
+            zero_first < 1_200,
+            "positive-weight records must still dominate: {zero_first}/2000"
+        );
+    }
+
+    #[test]
+    fn all_zero_weight_groups_are_selected_uniformly() {
+        let mut counts = [0_usize; 3];
+        for _ in 0..3_000 {
+            let ordered = weighted_srv_order(vec![
+                srv("a.example.com", 0),
+                srv("b.example.com", 0),
+                srv("c.example.com", 0),
+            ]);
+            assert_eq!(ordered.len(), 3);
+            let index = match ordered[0].host.as_str() {
+                "a.example.com" => 0,
+                "b.example.com" => 1,
+                "c.example.com" => 2,
+                other => panic!("unexpected host {other}"),
+            };
+            counts[index] += 1;
+        }
+        // Each record should win roughly a third of the draws (1000/3000).
+        for (index, count) in counts.iter().enumerate() {
+            assert!(
+                *count > 300,
+                "record {index} was selected only {count}/3000 times"
+            );
+        }
     }
 
     #[test]

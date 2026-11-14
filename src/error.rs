@@ -1,6 +1,7 @@
 //! Structured error model for query and parsing failures.
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::status::Transport;
 
@@ -14,7 +15,11 @@ pub enum Error {
     /// DNS resolution returned no usable socket address.
     ResolveFailed,
     /// Network or socket I/O failed.
-    Io(std::io::Error),
+    ///
+    /// The error is shared behind an [`Arc`] so cloning an [`Error`] keeps the
+    /// original OS error code (`raw_os_error`) intact and costs one reference
+    /// count instead of rebuilding the error.
+    Io(Arc<std::io::Error>),
     /// A DNS lookup or network operation exceeded the configured deadline.
     Timeout,
     /// DNS resolver setup or lookup failed.
@@ -79,9 +84,9 @@ impl Clone for Error {
     fn clone(&self) -> Self {
         match self {
             Self::ResolveFailed => Self::ResolveFailed,
-            // `std::io::Error` is not `Clone`; rebuilding it from its kind
-            // and message preserves both the error kind and the display text.
-            Self::Io(error) => Self::Io(std::io::Error::new(error.kind(), error.to_string())),
+            // `Arc` keeps the original OS error (kind, raw code, payload)
+            // intact; rebuilding it would drop `raw_os_error()`.
+            Self::Io(error) => Self::Io(Arc::clone(error)),
             Self::Timeout => Self::Timeout,
             Self::Dns(message) => Self::Dns(message.clone()),
             Self::InvalidInput(message) => Self::InvalidInput(message),
@@ -187,17 +192,23 @@ impl fmt::Display for Error {
 }
 
 fn write_attempts(attempts: &[Attempt], formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    if attempts.is_empty() {
+    let mut attempts = attempts.iter();
+    let Some(first) = attempts.next() else {
         return Ok(());
+    };
+    // Write straight into the formatter: no intermediate `Vec<String>` and no
+    // joined copy of every failure message.
+    write!(formatter, ": {first}")?;
+    for attempt in attempts {
+        write!(formatter, "; {attempt}")?;
     }
-    let messages: Vec<String> = attempts.iter().map(ToString::to_string).collect();
-    write!(formatter, ": {}", messages.join("; "))
+    Ok(())
 }
 
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(error) => Some(error),
+            Self::Io(error) => Some(error.as_ref()),
             Self::InvalidUtf8(error) => Some(error),
             // Aggregate errors chain to the first probe failure so callers
             // can walk `source()` down to the original I/O or HTTP error.
@@ -219,12 +230,72 @@ impl std::error::Error for Error {
 
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
-        Self::Io(error)
+        Self::Io(Arc::new(error))
     }
 }
 
 impl From<std::str::Utf8Error> for Error {
     fn from(error: std::str::Utf8Error) -> Self {
         Self::InvalidUtf8(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloning_preserves_the_original_os_error() {
+        let error = Error::from(std::io::Error::from_raw_os_error(10048));
+        let cloned = error.clone();
+
+        let Error::Io(cloned) = cloned else {
+            panic!("expected an I/O error");
+        };
+        assert_eq!(
+            cloned.raw_os_error(),
+            Some(10048),
+            "cloning must not drop the original OS error code"
+        );
+    }
+
+    #[test]
+    fn cloned_io_errors_share_the_same_allocation() {
+        let error = Error::from(std::io::Error::from_raw_os_error(10048));
+        let cloned = error.clone();
+
+        let (Error::Io(original), Error::Io(cloned)) = (&error, &cloned) else {
+            panic!("expected I/O errors");
+        };
+        assert!(
+            Arc::ptr_eq(original, cloned),
+            "a clone should bump the reference count, not rebuild the error"
+        );
+    }
+
+    #[cfg(feature = "java")]
+    #[test]
+    fn aggregate_errors_format_every_attempt() {
+        let error = Error::NoCompatibleJavaServer {
+            host: "play.example.com".into(),
+            java_port: 25_565,
+            attempts: vec![
+                Attempt {
+                    transport: Transport::JavaTcp,
+                    target: "play.example.com:25565".into(),
+                    error: Box::new(Error::Timeout),
+                },
+                Attempt {
+                    transport: Transport::JavaTcp,
+                    target: "srv.example.com:25566".into(),
+                    error: Box::new(Error::HttpStatus(503)),
+                },
+            ],
+        };
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("play.example.com:25565"));
+        assert!(rendered.contains("srv.example.com:25566"));
+        assert!(rendered.contains("; "), "attempts are separated by '; '");
     }
 }

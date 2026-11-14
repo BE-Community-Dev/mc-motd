@@ -84,6 +84,17 @@ All notable changes to this project will be documented in this file.
     reuse it, and zero or out-of-range limits are rejected at build time
   - Java SRV lookup returns a typed outcome (`Targets` / `NoRecords` /
     `Unavailable`) instead of inspecting error message text
+  - a `FlightGuard` removes the flight and publishes an error if the detached
+    shared task panics or is aborted, so a panicked probe cannot wedge a key
+    for the client's lifetime
+  - `max_queued(n)` bounds the number of distinct merged flights (and their
+    detached tasks) queued or running, separately from `max_in_flight`
+  - Java description flattening appends every array element and `extra` child
+    into one output buffer; aggregate error formatting writes directly into the
+    formatter instead of building a `Vec<String>`
+  - RFC 2782 weighted selection samples the inclusive `[0, sum]` range (so
+    zero-weight records keep their small chance) and shuffles all-zero groups
+    instead of always returning the first record
 - Contract fixes from review: an explicitly specified port skips SRV entirely;
   `Status.address` keeps the requested address (including explicit ports)
   untouched while SRV targets surface through `JavaDetails::srv`; status
@@ -99,9 +110,11 @@ All notable changes to this project will be documented in this file.
   `translate`).
 - Optional concurrency control: `ClientBuilder::merge_in_flight(true)` merges
   concurrent identical queries into one shared probe — every caller receives
-  the shared result, including a shared failure, without re-probing — and
-  `max_in_flight(n)` bounds the number of logical queries running at once with
-  one permit per query.
+  the shared result, including a shared failure, without re-probing, and a late
+  joiner shares the currently running probe rather than a fresh window.
+  `max_in_flight(n)` bounds the logical queries running at once with one permit
+  per query, and `max_queued(n)` bounds the distinct merged flights (and their
+  detached tasks) queued or running.
 - Regression tests for the HTTP cache policy guard, singleflight identity,
   port-aware flight keys, shared failures, caller cancellation, and the
   in-flight limit.
@@ -128,8 +141,10 @@ All notable changes to this project will be documented in this file.
 - **Breaking:** the transport cache moved from a process global into
   `Client` instances.
 - `Error` and `Attempt` implement `Clone`, so a shared singleflight failure can
-  be handed to every waiter without re-running the probe. Cloning an
-  `Error::Io` rebuilds it from its kind and message.
+  be handed to every waiter without re-running the probe. `Error::Io` now holds
+  an `Arc<std::io::Error>`, so cloning preserves the original OS error code
+  (`raw_os_error()`) and costs one reference count. **Breaking:** the `Io`
+  variant's field type changed from `std::io::Error` to `Arc<std::io::Error>`.
 
 ## 0.1.0 - Unreleased
 
