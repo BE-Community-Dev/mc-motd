@@ -18,25 +18,35 @@ name = "mc_motd"
 path = "src/lib.rs"
 
 [features]
-default = ["nethernet", "java"]
-nethernet = ["dep:reqwest", "dep:serde", "dep:serde_json"]
-java = ["dep:hickory-resolver"]
+default = ["java", "bedrock", "nethernet"]
+java = ["dep:hickory-resolver", "dep:serde", "dep:serde_json"]
+bedrock = []
+nethernet = ["bedrock", "dep:reqwest", "dep:serde", "dep:serde_json"]
+lan = ["bedrock", "dep:socket2"]
 
 [dependencies]
-hickory-resolver = { version = "0.25.2", default-features = false, features = ["system-config", "tokio"], optional = true }
-socket2 = { version = "0.6", default-features = false }
-tokio = { version = "1.48.0", default-features = false, features = ["io-util", "macros", "net", "sync", "time"] }
+tokio = { version = "1.48.0", default-features = false, features = ["io-util", "macros", "net", "time"] }
 
+hickory-resolver = { version = "0.25.2", default-features = false, features = ["system-config", "tokio"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }
 serde_json = { version = "1", default-features = false, features = ["std"], optional = true }
+socket2 = { version = "0.6", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.48.0", default-features = false, features = ["io-util", "macros", "net", "rt", "time"] }
 
 [[example]]
 name = "query"
-required-features = ["java"]
+required-features = ["java", "bedrock"]
+
+[[example]]
+name = "bedrock_only"
+required-features = ["bedrock"]
+
+[[example]]
+name = "lan_discovery"
+required-features = ["lan"]
 
 [lints.rust]
 unsafe_code = "warn"

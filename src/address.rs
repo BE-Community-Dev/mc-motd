@@ -1,10 +1,24 @@
 use std::borrow::Cow;
 use std::net::IpAddr;
 
-use crate::{MotdError, ServerAddress};
+use crate::error::Error;
 
 const MAX_HOST_LEN: usize = 253;
 const MAX_LABEL_LEN: usize = 63;
+
+/// Normalized server address and edition-specific ports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ServerAddress {
+    /// Normalized hostname or IP address.
+    pub host: String,
+    /// Java Edition port to query.
+    pub java_port: u16,
+    /// Bedrock Edition port to query.
+    pub bedrock_port: u16,
+    /// Explicit port from user input, if one was present.
+    pub explicit_port: Option<u16>,
+}
 
 /// Parse a user-facing server address into a normalized host and edition ports.
 ///
@@ -12,13 +26,13 @@ const MAX_LABEL_LEN: usize = 63;
 ///
 /// # Errors
 ///
-/// Returns [`MotdError::InvalidInput`] when the input is empty, the host is
+/// Returns [`Error::InvalidInput`] when the input is empty, the host is
 /// invalid, a bracketed IPv6 address is malformed, or a port is invalid.
 pub fn parse_server_address(
     input: &str,
     default_java_port: u16,
     default_bedrock_port: u16,
-) -> Result<ServerAddress, MotdError> {
+) -> Result<ServerAddress, Error> {
     validate_port(default_java_port)?;
     validate_port(default_bedrock_port)?;
 
@@ -68,9 +82,9 @@ pub fn parse_server_address(
 ///
 /// # Errors
 ///
-/// Returns [`MotdError::InvalidInput`] if the input is empty or not a valid
+/// Returns [`Error::InvalidInput`] if the input is empty or not a valid
 /// hostname, IPv4 address, or IPv6 address without a port.
-pub fn normalize_server_host(input: &str) -> Result<Cow<'_, str>, MotdError> {
+pub fn normalize_server_host(input: &str) -> Result<Cow<'_, str>, Error> {
     let value = trim_server_input(input)?;
     let value = value.as_ref().trim_end_matches('.');
 
@@ -83,10 +97,10 @@ pub fn normalize_server_host(input: &str) -> Result<Cow<'_, str>, MotdError> {
     }
 }
 
-fn trim_server_input(input: &str) -> Result<Cow<'_, str>, MotdError> {
+fn trim_server_input(input: &str) -> Result<Cow<'_, str>, Error> {
     let value = input.trim();
     if value.is_empty() {
-        return Err(MotdError::InvalidInput("server host is empty"));
+        return Err(Error::InvalidInput("server host is empty"));
     }
 
     if value == input {
@@ -100,27 +114,27 @@ fn trim_server_input(input: &str) -> Result<Cow<'_, str>, MotdError> {
 ///
 /// # Errors
 ///
-/// Returns [`MotdError::InvalidInput`] if the host is empty, too long, contains
+/// Returns [`Error::InvalidInput`] if the host is empty, too long, contains
 /// whitespace or control characters, contains an unbracketed port, or has an
 /// invalid DNS label.
-pub fn validate_server_host(host: &str) -> Result<(), MotdError> {
+pub fn validate_server_host(host: &str) -> Result<(), Error> {
     if host.is_empty() {
-        return Err(MotdError::InvalidInput("server host is empty"));
+        return Err(Error::InvalidInput("server host is empty"));
     }
     if host.len() > MAX_HOST_LEN {
-        return Err(MotdError::InvalidInput("server host is too long"));
+        return Err(Error::InvalidInput("server host is too long"));
     }
     if host
         .bytes()
         .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
     {
-        return Err(MotdError::InvalidInput("server host contains whitespace"));
+        return Err(Error::InvalidInput("server host contains whitespace"));
     }
     if host.parse::<IpAddr>().is_ok() {
         return Ok(());
     }
     if host.contains(':') {
-        return Err(MotdError::InvalidInput(
+        return Err(Error::InvalidInput(
             "IPv6 addresses with ports must use [addr]:port",
         ));
     }
@@ -136,12 +150,10 @@ pub fn validate_server_host(host: &str) -> Result<(), MotdError> {
 ///
 /// # Errors
 ///
-/// Returns [`MotdError::InvalidInput`] when the port is zero.
-pub fn validate_port(port: u16) -> Result<(), MotdError> {
+/// Returns [`Error::InvalidInput`] when the port is zero.
+pub fn validate_port(port: u16) -> Result<(), Error> {
     if port == 0 {
-        return Err(MotdError::InvalidInput(
-            "server port must be greater than 0",
-        ));
+        return Err(Error::InvalidInput("server port must be greater than 0"));
     }
     Ok(())
 }
@@ -164,12 +176,12 @@ pub fn normalize_srv_target(target: &str) -> String {
     target.trim_end_matches('.').to_string()
 }
 
-fn split_bracketed_host_without_port(host: &str) -> Result<Option<&str>, MotdError> {
+fn split_bracketed_host_without_port(host: &str) -> Result<Option<&str>, Error> {
     let Some(rest) = host.strip_prefix('[') else {
         return Ok(None);
     };
     let Some((address, suffix)) = rest.split_once(']') else {
-        return Err(MotdError::InvalidInput(
+        return Err(Error::InvalidInput(
             "IPv6 address is missing closing bracket",
         ));
     };
@@ -179,10 +191,10 @@ fn split_bracketed_host_without_port(host: &str) -> Result<Option<&str>, MotdErr
     Ok(None)
 }
 
-fn split_host_port(host: &str) -> Result<Option<(&str, u16)>, MotdError> {
+fn split_host_port(host: &str) -> Result<Option<(&str, u16)>, Error> {
     if let Some(rest) = host.strip_prefix('[') {
         let Some((address, suffix)) = rest.split_once(']') else {
-            return Err(MotdError::InvalidInput(
+            return Err(Error::InvalidInput(
                 "IPv6 address is missing closing bracket",
             ));
         };
@@ -191,7 +203,7 @@ fn split_host_port(host: &str) -> Result<Option<(&str, u16)>, MotdError> {
             return Ok(None);
         }
         let Some(port_text) = suffix.strip_prefix(':') else {
-            return Err(MotdError::InvalidInput("invalid IPv6 address suffix"));
+            return Err(Error::InvalidInput("invalid IPv6 address suffix"));
         };
         return parse_port(port_text).map(|port| Some((address, port)));
     }
@@ -210,26 +222,24 @@ fn split_host_port(host: &str) -> Result<Option<(&str, u16)>, MotdError> {
     parse_port(port_text).map(|port| Some((name, port)))
 }
 
-fn parse_port(value: &str) -> Result<u16, MotdError> {
+fn parse_port(value: &str) -> Result<u16, Error> {
     let port = value
         .parse::<u16>()
-        .map_err(|_| MotdError::InvalidInput("server port is invalid"))?;
+        .map_err(|_| Error::InvalidInput("server port is invalid"))?;
     validate_port(port)?;
     Ok(port)
 }
 
-fn validate_dns_label(label: &str) -> Result<(), MotdError> {
+fn validate_dns_label(label: &str) -> Result<(), Error> {
     if label.is_empty() {
-        return Err(MotdError::InvalidInput(
-            "server host contains an empty label",
-        ));
+        return Err(Error::InvalidInput("server host contains an empty label"));
     }
     if label.len() > MAX_LABEL_LEN {
-        return Err(MotdError::InvalidInput("server host label is too long"));
+        return Err(Error::InvalidInput("server host label is too long"));
     }
     let bytes = label.as_bytes();
     if bytes.first() == Some(&b'-') || bytes.last() == Some(&b'-') {
-        return Err(MotdError::InvalidInput(
+        return Err(Error::InvalidInput(
             "server host label cannot start or end with '-'",
         ));
     }
@@ -237,7 +247,7 @@ fn validate_dns_label(label: &str) -> Result<(), MotdError> {
         .iter()
         .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
     {
-        return Err(MotdError::InvalidInput(
+        return Err(Error::InvalidInput(
             "server host contains invalid characters",
         ));
     }
@@ -294,7 +304,7 @@ mod tests {
     fn rejects_invalid_host() {
         let error = parse_server_address("bad host", 25565, 19132).expect_err("host should fail");
 
-        assert!(matches!(error, MotdError::InvalidInput(_)));
+        assert!(matches!(error, Error::InvalidInput(_)));
     }
 
     #[test]
@@ -302,6 +312,6 @@ mod tests {
         let error = parse_server_address("minecraft://play.example.com", 25565, 19132)
             .expect_err("URL-like input should fail");
 
-        assert!(matches!(error, MotdError::InvalidInput(_)));
+        assert!(matches!(error, Error::InvalidInput(_)));
     }
 }
