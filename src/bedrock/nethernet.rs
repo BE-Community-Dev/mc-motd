@@ -26,7 +26,7 @@ const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Process-wide shared HTTP client used by the default [`crate::Client`].
-static SHARED_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
+static SHARED_HTTP: OnceLock<std::result::Result<reqwest::Client, String>> = OnceLock::new();
 
 /// Build the shared HTTP client used for `NetherNet` queries.
 ///
@@ -34,18 +34,21 @@ static SHARED_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
 /// timeout, no redirects, and a `mc-motd/<version>` user agent. Reusing one
 /// client keeps its connection pool alive across queries instead of rebuilding
 /// it per query.
-pub(crate) fn build_http_client() -> reqwest::Client {
+pub(crate) fn build_http_client() -> std::result::Result<reqwest::Client, Error> {
     reqwest::Client::builder()
         .user_agent(concat!("mc-motd/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(CLIENT_CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .map_err(|error| Error::Http(error.to_string()))
 }
 
 /// Return the HTTP client used by the default [`crate::Client`].
-pub(crate) fn shared_http() -> &'static reqwest::Client {
-    SHARED_HTTP.get_or_init(build_http_client)
+pub(crate) fn shared_http() -> std::result::Result<&'static reqwest::Client, Error> {
+    SHARED_HTTP
+        .get_or_init(|| build_http_client().map_err(|error| error.to_string()))
+        .as_ref()
+        .map_err(|message| Error::Http(message.clone()))
 }
 
 /// Query a Bedrock Edition server address over `NetherNet` only.
@@ -97,7 +100,7 @@ pub async fn query_url(url: &str, options: QueryOptions) -> Result<Status> {
     let deadline = started
         .checked_add(resolved.timeout)
         .ok_or(Error::InvalidInput("query timeout is too large"))?;
-    let http = shared_http();
+    let http = shared_http()?;
     let used_https;
     let mut details = match parsed.scheme() {
         "https" => {

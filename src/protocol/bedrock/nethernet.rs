@@ -141,12 +141,12 @@ fn validate_join_response(response: JoinResponseRef<'_>) -> Result<NetherNetDeta
             "NetherNet join response is missing the name field",
         ));
     }
-    if let (Some(players), Some(max_players)) = (response.players, response.max_players) {
-        if players > max_players {
-            return Err(Error::InvalidPacket(
-                "NetherNet player count exceeds the reported maximum",
-            ));
-        }
+    if let (Some(players), Some(max_players)) = (response.players, response.max_players)
+        && players > max_players
+    {
+        return Err(Error::InvalidPacket(
+            "NetherNet player count exceeds the reported maximum",
+        ));
     }
 
     Ok(NetherNetDetailsRef {

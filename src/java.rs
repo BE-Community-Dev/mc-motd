@@ -95,12 +95,16 @@ pub(crate) async fn resolve_srv_with(
         .map_err(|error| Error::Dns(error.to_string()))?;
 
     let records = lookup
+        .answers()
         .iter()
-        .map(|srv| SrvTarget {
-            host: srv.target().to_utf8().trim_end_matches('.').to_string(),
-            port: srv.port(),
-            priority: srv.priority(),
-            weight: srv.weight(),
+        .filter_map(|record| match &record.data {
+            hickory_resolver::proto::rr::RData::SRV(srv) => Some(SrvTarget {
+                host: srv.target.to_utf8().trim_end_matches('.').to_string(),
+                port: srv.port,
+                priority: srv.priority,
+                weight: srv.weight,
+            }),
+            _ => None,
         })
         .collect::<Vec<_>>();
     if records.is_empty() {
@@ -215,6 +219,20 @@ pub(crate) async fn run(
                 target: address.host.clone(),
                 error: Box::new(Error::Dns("no SRV records found".to_string())),
             }),
+            // SRV records pointing at "." are an authoritative "service
+            // unavailable": do not silently fall back to direct probing.
+            Err(error @ Error::Dns(_)) if error.to_string().contains("unavailable") => {
+                prefix_attempts.push(Attempt {
+                    transport: Transport::JavaTcp,
+                    target: address.host.clone(),
+                    error: Box::new(error),
+                });
+                return Err(Error::NoCompatibleJavaServer {
+                    host: address.host.clone(),
+                    java_port: address.java_port,
+                    attempts: prefix_attempts,
+                });
+            }
             Err(error) => prefix_attempts.push(Attempt {
                 transport: Transport::JavaTcp,
                 target: address.host.clone(),
@@ -288,7 +306,17 @@ async fn probe_target(
 ) -> Result<Status, Error> {
     let ips = crate::client::engine::resolve_probe_ips(&target.host, deadline).await?;
     let mut last = None;
+    // Fair-share the remaining deadline across the target's addresses.
+    let mut attempts_left = ips.len();
     for ip in ips {
+        let remaining = crate::client::engine::remaining(deadline)?;
+        let share = remaining / u32::try_from(attempts_left).unwrap_or(u32::MAX);
+        let attempt_budget = share.max(crate::client::MIN_ATTEMPT_BUDGET.min(remaining));
+        let attempt_deadline = Instant::now()
+            .checked_add(attempt_budget)
+            .unwrap_or(deadline);
+        attempts_left = attempts_left.saturating_sub(1);
+
         let socket = SocketAddr::new(ip, target.port);
         match query_socket(
             socket,
@@ -296,7 +324,7 @@ async fn probe_target(
             target.port,
             requested,
             resolved,
-            deadline,
+            attempt_deadline,
         )
         .await
         {
@@ -350,10 +378,11 @@ pub(crate) async fn probe_direct(
     // dropping first address cannot starve the failover candidates.
     let mut attempts_left = candidate_ips.len();
     for ip in candidate_ips {
-        let share = crate::client::engine::remaining(deadline).unwrap_or_default()
-            / u32::try_from(attempts_left).unwrap_or(u32::MAX);
+        let remaining = crate::client::engine::remaining(deadline).unwrap_or_default();
+        let share = remaining / u32::try_from(attempts_left).unwrap_or(u32::MAX);
+        let attempt_budget = share.max(crate::client::MIN_ATTEMPT_BUDGET.min(remaining));
         let attempt_deadline = Instant::now()
-            .checked_add(share.max(crate::client::MIN_ATTEMPT_BUDGET))
+            .checked_add(attempt_budget)
             .unwrap_or(deadline);
         attempts_left = attempts_left.saturating_sub(1);
 
@@ -499,11 +528,12 @@ fn describe(value: &serde_json::Value) -> String {
                 .and_then(serde_json::Value::as_str)
                 .map_or_else(String::new, ToString::to_string);
             if text.is_empty() {
-                if let Some(translated) =
-                    object.get("translate").and_then(serde_json::Value::as_str)
-                {
-                    text.push_str(translated);
-                }
+                text.push_str(
+                    object
+                        .get("translate")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                );
             }
             if let Some(extra) = object.get("extra").and_then(serde_json::Value::as_array) {
                 for component in extra {

@@ -432,7 +432,6 @@ impl Client {
     }
 
     #[allow(clippy::unused_self)] // the borrowed resources differ per feature set
-    #[allow(clippy::unused_self)]
     fn parts(&self) -> Parts<'_> {
         Parts {
             _lifetime: std::marker::PhantomData,
@@ -510,6 +509,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the maximum accepted Java status packet size.
+    #[must_use]
+    pub fn max_java_status_bytes(mut self, max_java_status_bytes: usize) -> Self {
+        self.options.max_java_status_bytes = Some(max_java_status_bytes);
+        self
+    }
+
     /// Set the transport-cache capacity; zero disables caching.
     #[cfg(feature = "bedrock")]
     #[must_use]
@@ -527,11 +533,12 @@ impl ClientBuilder {
     /// configured client.
     pub fn build(self) -> std::result::Result<Client, crate::error::Error> {
         #[cfg(feature = "nethernet")]
-        let http = crate::bedrock::nethernet::build_http_client();
+        let http = crate::bedrock::nethernet::build_http_client()?;
         #[cfg(feature = "java")]
         let resolver = hickory_resolver::Resolver::builder_tokio()
             .map_err(|error| crate::error::Error::Dns(error.to_string()))?
-            .build();
+            .build()
+            .map_err(|error| crate::error::Error::Dns(error.to_string()))?;
         Ok(Client {
             inner: Arc::new(ClientInner {
                 options: self.options,

@@ -2,7 +2,7 @@
 name = "mc-motd"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Lightweight async Minecraft MOTD query library"
 readme = "README.md"
@@ -27,7 +27,7 @@ lan = ["bedrock", "dep:socket2"]
 [dependencies]
 tokio = { version = "1.48.0", default-features = false, features = ["io-util", "macros", "net", "time"] }
 
-hickory-resolver = { version = "0.25.2", default-features = false, features = ["system-config", "tokio"], optional = true }
+hickory-resolver = { version = "0.26.3", default-features = false, features = ["system-config", "tokio"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }
 serde_json = { version = "1", default-features = false, features = ["std"], optional = true }

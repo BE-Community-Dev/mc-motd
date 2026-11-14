@@ -181,8 +181,9 @@ async fn collect_pongs(
                     continue;
                 }
                 // Correlate the pong with our ping timestamp to ignore stale
-                // or foreign replies.
-                if buffer.len() < 9 || buffer[1..9] != ping[1..9] {
+                // or foreign replies; check the actual received length, not
+                // the buffer capacity.
+                if len < 9 || buffer[..len][1..9] != ping[1..9] {
                     continue;
                 }
                 let Ok(details) = codec::decode_pong(&buffer[..len]).map(|motd| motd.to_owned())

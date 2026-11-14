@@ -61,6 +61,11 @@ pub async fn query_with(address: impl AsRef<str>, options: QueryOptions) -> Resu
 /// Returns [`Error::InvalidInput`] if `buffer` is too small for a pong header,
 /// [`Error`] for socket creation, send, and receive failures or timeouts, and
 /// [`Error::InvalidPacket`] for invalid or truncated pongs.
+///
+/// # Panics
+///
+/// Panics if the ping timestamp cannot be narrowed to 8 bytes, which is
+/// impossible for the fixed-size packet built by [`codec::encode_ping`].
 pub async fn query_addr_into(
     address: SocketAddr,
     buffer: &mut [u8],
@@ -71,7 +76,9 @@ pub async fn query_addr_into(
             "pong buffer must hold at least 35 bytes",
         ));
     }
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(Error::InvalidInput("query timeout is too large"))?;
     let bind_address = if address.is_ipv4() {
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
     } else {
@@ -95,7 +102,9 @@ pub async fn query_addr_into(
 
     // Correlate the pong with our ping timestamp: stale or foreign pongs are
     // ignored until the deadline runs out.
-    let expected_time = ping[1..9].to_vec();
+    let expected_time: [u8; 8] = ping[1..9]
+        .try_into()
+        .expect("ping timestamp is always 8 bytes");
     let len = loop {
         let received = time::timeout(
             crate::client::engine::remaining(deadline)?,
@@ -103,7 +112,7 @@ pub async fn query_addr_into(
         )
         .await
         .map_err(|_| Error::Timeout)??;
-        if buffer.len() >= 9 && buffer[1..9] == expected_time[..] {
+        if received >= 9 && buffer[..received][1..9] == expected_time {
             break received;
         }
     };
@@ -111,7 +120,6 @@ pub async fn query_addr_into(
     codec::decode_pong(&buffer[..len])
 }
 
-/// Query a host over `RakNet`, resolving it first.
 /// Query a host over `RakNet`, resolving it first and trying every resolved
 /// address in order (IPv4 first) within the shared deadline.
 async fn query_host(host: &str, port: u16, deadline: Instant) -> Result<RakNetDetails, Error> {
@@ -129,9 +137,11 @@ async fn query_host(host: &str, port: u16, deadline: Instant) -> Result<RakNetDe
     // silently dropping first address cannot starve the failover candidates.
     let mut attempts_left = addresses.len();
     for address in addresses {
-        let share = crate::client::engine::remaining(deadline)?
-            / u32::try_from(attempts_left).unwrap_or(u32::MAX);
-        let attempt_budget = share.max(crate::client::MIN_ATTEMPT_BUDGET);
+        let remaining = crate::client::engine::remaining(deadline)?;
+        let share = remaining / u32::try_from(attempts_left).unwrap_or(u32::MAX);
+        // The floor is itself capped by the remaining deadline so a short
+        // total budget is never overshot by a single attempt.
+        let attempt_budget = share.max(crate::client::MIN_ATTEMPT_BUDGET.min(remaining));
         attempts_left = attempts_left.saturating_sub(1);
         match query_addr_into(address, &mut buffer, attempt_budget).await {
             Ok(pong) => return Ok(pong.to_owned()),
@@ -163,9 +173,11 @@ pub(crate) async fn probe(
         let mut last = None;
         let mut attempts_left = ips.len();
         for ip in ips {
-            let share = crate::client::engine::remaining(deadline)?
-                / u32::try_from(attempts_left).unwrap_or(u32::MAX);
-            let attempt_budget = share.max(crate::client::MIN_ATTEMPT_BUDGET);
+            let remaining = crate::client::engine::remaining(deadline)?;
+            let share = remaining / u32::try_from(attempts_left).unwrap_or(u32::MAX);
+            // The floor is itself capped by the remaining deadline so a short
+            // total budget is never overshot by a single attempt.
+            let attempt_budget = share.max(crate::client::MIN_ATTEMPT_BUDGET.min(remaining));
             attempts_left = attempts_left.saturating_sub(1);
             match query_addr_into(SocketAddr::new(*ip, port), &mut buffer, attempt_budget).await {
                 Ok(pong) => return Ok(pong.to_owned()),
