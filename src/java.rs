@@ -161,16 +161,12 @@ pub(crate) async fn lookup_srv(
 }
 
 /// Order SRV records by priority with RFC 2782 weighted-random selection
-/// inside each priority class. Zero-weight records keep the lowest selection
-/// probability per the RFC and are only ordered once nothing else remains.
-fn weighted_srv_order(mut records: Vec<SrvTarget>) -> Vec<SrvTarget> {
-    records.sort_by(|left, right| {
-        left.priority
-            .cmp(&right.priority)
-            .then_with(|| left.host.cmp(&right.host))
-            .then_with(|| left.port.cmp(&right.port))
-    });
-
+/// inside each priority class.
+///
+/// The random source is seeded from the system clock. Tests use
+/// [`weighted_srv_order_with`] with a fixed seed so distribution assertions are
+/// deterministic.
+fn weighted_srv_order(records: Vec<SrvTarget>) -> Vec<SrvTarget> {
     let mut seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(1_u64, |duration| u64::from(duration.subsec_nanos()) | 1);
@@ -181,6 +177,20 @@ fn weighted_srv_order(mut records: Vec<SrvTarget>) -> Vec<SrvTarget> {
         seed ^= seed << 17;
         seed
     };
+    weighted_srv_order_with(records, &mut random)
+}
+
+/// Order SRV records with a caller-supplied random source.
+fn weighted_srv_order_with(
+    mut records: Vec<SrvTarget>,
+    random: &mut impl FnMut() -> u64,
+) -> Vec<SrvTarget> {
+    records.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.host.cmp(&right.host))
+            .then_with(|| left.port.cmp(&right.port))
+    });
 
     let mut ordered = Vec::with_capacity(records.len());
     while !records.is_empty() {
@@ -675,16 +685,31 @@ mod tests {
         }
     }
 
+    /// Deterministic xorshift64 source for distribution tests.
+    ///
+    /// The production path seeds from the clock; tests pin the seed so the
+    /// statistical assertions below cannot flake on CI.
+    fn seeded_random(seed: u64) -> impl FnMut() -> u64 {
+        let mut seed = seed | 1;
+        move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        }
+    }
+
     #[test]
     fn weighted_srv_order_respects_rfc_2782_weights() {
         // A heavy record dominates, but the inclusive [0, sum] draw gives the
         // zero-weight record a small chance (1/101 here) instead of none.
+        let mut random = seeded_random(0x5eed_1234_5678_9abc);
         let mut heavy_first = 0;
         for _ in 0..1_000 {
-            let ordered = weighted_srv_order(vec![
-                srv("heavy.example.com", 100),
-                srv("light.example.com", 0),
-            ]);
+            let ordered = weighted_srv_order_with(
+                vec![srv("heavy.example.com", 100), srv("light.example.com", 0)],
+                &mut random,
+            );
             assert_eq!(ordered.len(), 2, "every record must be ordered");
             if ordered[0].host == "heavy.example.com" {
                 heavy_first += 1;
@@ -700,13 +725,17 @@ mod tests {
     fn weighted_srv_order_gives_zero_weight_records_a_nonzero_chance() {
         // RFC 2782 places zero-weight records first and samples [0, sum]
         // inclusively, so a zero-weight record wins when the draw is zero.
+        let mut random = seeded_random(0x0ddc_0ffe_e123_4567);
         let mut zero_first = 0;
         for _ in 0..2_000 {
-            let ordered = weighted_srv_order(vec![
-                srv("zero.example.com", 0),
-                srv("a.example.com", 1),
-                srv("b.example.com", 1),
-            ]);
+            let ordered = weighted_srv_order_with(
+                vec![
+                    srv("zero.example.com", 0),
+                    srv("a.example.com", 1),
+                    srv("b.example.com", 1),
+                ],
+                &mut random,
+            );
             assert_eq!(ordered.len(), 3);
             if ordered[0].host == "zero.example.com" {
                 zero_first += 1;
@@ -724,13 +753,17 @@ mod tests {
 
     #[test]
     fn all_zero_weight_groups_are_selected_uniformly() {
+        let mut random = seeded_random(0xabcd_ef01_2345_6789);
         let mut counts = [0_usize; 3];
         for _ in 0..3_000 {
-            let ordered = weighted_srv_order(vec![
-                srv("a.example.com", 0),
-                srv("b.example.com", 0),
-                srv("c.example.com", 0),
-            ]);
+            let ordered = weighted_srv_order_with(
+                vec![
+                    srv("a.example.com", 0),
+                    srv("b.example.com", 0),
+                    srv("c.example.com", 0),
+                ],
+                &mut random,
+            );
             assert_eq!(ordered.len(), 3);
             let index = match ordered[0].host.as_str() {
                 "a.example.com" => 0,

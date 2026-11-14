@@ -84,17 +84,22 @@ All notable changes to this project will be documented in this file.
     reuse it, and zero or out-of-range limits are rejected at build time
   - Java SRV lookup returns a typed outcome (`Targets` / `NoRecords` /
     `Unavailable`) instead of inspecting error message text
-  - a `FlightGuard` removes the flight and publishes an error if the detached
-    shared task panics or is aborted, so a panicked probe cannot wedge a key
-    for the client's lifetime
-  - `max_queued(n)` bounds the number of distinct merged flights (and their
-    detached tasks) queued or running, separately from `max_in_flight`
+  - a `FlightGuard` is armed before the first admission await and captured by
+    the detached probe task, so cancellation during admission, abort, panic, or
+    runtime shutdown all remove the flight and publish an error; its message
+    is neutral because `Drop` cannot distinguish those cases
+  - `max_queued(n)` bounds admitted merged probes separately from
+    `max_in_flight`; the pending flight is inserted before waiting for a queue
+    slot, so a saturated queue still merges same-key callers into one probe
+    instead of re-probing per released slot
   - Java description flattening appends every array element and `extra` child
     into one output buffer; aggregate error formatting writes directly into the
     formatter instead of building a `Vec<String>`
   - RFC 2782 weighted selection samples the inclusive `[0, sum]` range (so
     zero-weight records keep their small chance) and shuffles all-zero groups
-    instead of always returning the first record
+    instead of always returning the first record; the random source is
+    injectable and the distribution tests use fixed seeds, so CI cannot flake
+    on clock entropy
 - Contract fixes from review: an explicitly specified port skips SRV entirely;
   `Status.address` keeps the requested address (including explicit ports)
   untouched while SRV targets surface through `JavaDetails::srv`; status
@@ -113,8 +118,9 @@ All notable changes to this project will be documented in this file.
   the shared result, including a shared failure, without re-probing, and a late
   joiner shares the currently running probe rather than a fresh window.
   `max_in_flight(n)` bounds the logical queries running at once with one permit
-  per query, and `max_queued(n)` bounds the distinct merged flights (and their
-  detached tasks) queued or running.
+  per query, and `max_queued(n)` bounds the distinct merged probes (and their
+  detached tasks) admitted at once. Callers for the same key share one pending
+  flight even while the queue is saturated.
 - Regression tests for the HTTP cache policy guard, singleflight identity,
   port-aware flight keys, shared failures, caller cancellation, and the
   in-flight limit.
