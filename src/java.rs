@@ -274,8 +274,18 @@ pub(crate) async fn probe_srv_sequence(
     deadline: Instant,
 ) -> Result<Status, Vec<Attempt>> {
     let mut attempts = Vec::new();
+    // Fair-share the remaining deadline across SRV targets so one silent
+    // target cannot consume the budget meant for the rest.
+    let mut targets_left = targets.len();
     for target in targets {
-        match probe_target(address, target, resolved, deadline).await {
+        let remaining = crate::client::engine::remaining(deadline).unwrap_or_default();
+        let target_budget = remaining / u32::try_from(targets_left).unwrap_or(u32::MAX);
+        let target_deadline = Instant::now()
+            .checked_add(target_budget)
+            .unwrap_or(deadline);
+        targets_left = targets_left.saturating_sub(1);
+
+        match probe_target(address, target, resolved, target_deadline).await {
             Ok(status) => return Ok(status),
             Err(error) => attempts.push(Attempt {
                 transport: Transport::JavaTcp,
@@ -306,14 +316,13 @@ async fn probe_target(
 ) -> Result<Status, Error> {
     let ips = crate::client::engine::resolve_probe_ips(&target.host, deadline).await?;
     let mut last = None;
-    // Fair-share the remaining deadline across the target's addresses.
+    // The target deadline is already a fair slice of the whole query; split
+    // it across the target's own addresses.
     let mut attempts_left = ips.len();
     for ip in ips {
         let remaining = crate::client::engine::remaining(deadline)?;
-        let share = remaining / u32::try_from(attempts_left).unwrap_or(u32::MAX);
-        let attempt_budget = share.max(crate::client::MIN_ATTEMPT_BUDGET.min(remaining));
         let attempt_deadline = Instant::now()
-            .checked_add(attempt_budget)
+            .checked_add(remaining / u32::try_from(attempts_left).unwrap_or(u32::MAX))
             .unwrap_or(deadline);
         attempts_left = attempts_left.saturating_sub(1);
 
@@ -375,12 +384,12 @@ pub(crate) async fn probe_direct(
     };
 
     // Fair-share the shared deadline across the addresses so a silently
-    // dropping first address cannot starve the failover candidates.
+    // dropping first address gets its slice and the remaining candidates
+    // split whatever is left.
     let mut attempts_left = candidate_ips.len();
     for ip in candidate_ips {
         let remaining = crate::client::engine::remaining(deadline).unwrap_or_default();
-        let share = remaining / u32::try_from(attempts_left).unwrap_or(u32::MAX);
-        let attempt_budget = share.max(crate::client::MIN_ATTEMPT_BUDGET.min(remaining));
+        let attempt_budget = remaining / u32::try_from(attempts_left).unwrap_or(u32::MAX);
         let attempt_deadline = Instant::now()
             .checked_add(attempt_budget)
             .unwrap_or(deadline);

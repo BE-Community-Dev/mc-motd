@@ -10,13 +10,21 @@
 //! The crate-level free functions use a process-wide default client, so
 //! [`crate::query`] behaves like a shared [`Client`] too.
 
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::collections::HashMap;
+#[cfg(any(feature = "nethernet", all(feature = "java", feature = "bedrock")))]
+use std::future::Future;
+#[cfg(all(test, feature = "bedrock"))]
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use tokio::time;
 
 use crate::address::{self, ServerAddress};
 #[cfg(feature = "bedrock")]
 use crate::cache::TransportCache;
-use crate::error::Result;
+use crate::error::{Error, Result};
 #[cfg(feature = "bedrock")]
 use crate::status::Transport;
 use crate::status::{Edition, Status};
@@ -29,10 +37,6 @@ pub const DEFAULT_BEDROCK_PORT: u16 = 19_132;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(3_000);
 /// Default transport-cache capacity.
 pub const DEFAULT_CACHE_CAPACITY: usize = 1024;
-/// Minimum budget a single address attempt gets during multi-address
-/// failover, so a large candidate list still gives every address a usable
-/// slice of the shared deadline.
-pub(crate) const MIN_ATTEMPT_BUDGET: Duration = Duration::from_millis(250);
 /// How long a cache-hit transport is waited for exclusively before the other
 /// transport joins the race as a parallel fallback.
 #[cfg(feature = "nethernet")]
@@ -197,26 +201,33 @@ impl QueryOptions {
 
 /// Resources shared between the queries of one [`Client`].
 #[allow(dead_code)]
-pub(crate) struct Parts<'a> {
-    /// Keeps the borrow lifetime alive even when no borrowed field is
-    /// compiled in (e.g. Java-only builds without Bedrock).
-    _lifetime: std::marker::PhantomData<&'a ()>,
+#[derive(Clone)]
+pub(crate) struct Parts {
     #[cfg(feature = "bedrock")]
-    pub(crate) cache: &'a TransportCache,
+    pub(crate) cache: Arc<TransportCache>,
     #[cfg(feature = "nethernet")]
-    pub(crate) http: &'a reqwest::Client,
+    pub(crate) http: reqwest::Client,
+    pub(crate) resolver: SrvResolver,
+    /// Bounds concurrent probes for this client.
+    pub(crate) in_flight: Arc<tokio::sync::Semaphore>,
 }
 
 struct ClientInner {
     options: QueryOptions,
+    /// Merge concurrent identical full queries into one shared probe.
+    merge_in_flight: bool,
     #[cfg(feature = "bedrock")]
-    cache: TransportCache,
+    cache: Arc<TransportCache>,
     #[cfg(feature = "nethernet")]
     http: reqwest::Client,
     /// SRV resolver shared by this client's Java queries (also holds the
     /// background task hickory needs).
-    #[cfg(feature = "java")]
-    pub(crate) resolver: hickory_resolver::TokioResolver,
+    pub(crate) resolver: SrvResolver,
+    /// Bounds the number of probes running concurrently across this client.
+    in_flight: Arc<tokio::sync::Semaphore>,
+    /// Merges concurrent identical queries into one shared probe when
+    /// `merge_in_flight` was enabled on the builder.
+    flights: Arc<Mutex<HashMap<String, Arc<Flight>>>>,
 }
 
 /// Reusable query client.
@@ -249,11 +260,30 @@ impl Client {
     pub async fn query(&self, address: impl AsRef<str>) -> Result<Status> {
         let resolved = self.inner.options.resolve_over(&QueryOptions::default());
         let parsed = Self::parse(address, &resolved)?;
-        #[cfg(feature = "java")]
-        let status = engine::full(&self.parts(), &parsed, &resolved, self.srv_resolver()).await;
-        #[cfg(not(feature = "java"))]
-        let status = engine::full(&self.parts(), &parsed, &resolved).await;
-        status
+        if self.inner.merge_in_flight {
+            let deadline = Instant::now()
+                .checked_add(resolved.timeout)
+                .ok_or(Error::InvalidInput("query timeout is too large"))?;
+            let key = flight_key(&parsed, &resolved);
+            let parts = self.parts();
+            // `SrvResolver` is `()` without the `java` feature; cloning the
+            // unit placeholder is intentional and harmless in that build.
+            #[allow(clippy::let_unit_value, clippy::clone_on_copy)]
+            let srv_resolver = self.srv_resolver().clone();
+            #[allow(clippy::let_unit_value, clippy::clone_on_copy)]
+            let probe = Arc::new(move || {
+                let parts = parts.clone();
+                let parsed = parsed.clone();
+                let resolved = resolved.clone();
+                #[allow(clippy::let_unit_value, clippy::clone_on_copy)]
+                let srv_resolver = srv_resolver.clone();
+                Box::pin(
+                    async move { engine::full(&parts, &parsed, &resolved, &srv_resolver).await },
+                ) as Pin<Box<dyn Future<Output = Result<Status, Error>> + Send>>
+            });
+            return self.merged_probe(&key, deadline, probe).await;
+        }
+        engine::full(&self.parts(), &parsed, &resolved, self.srv_resolver()).await
     }
 
     /// Query a server address with explicit per-query options.
@@ -270,12 +300,30 @@ impl Client {
         // fields inherit the builder values.
         let resolved = options.resolve_over(&self.inner.options);
         let parsed = Self::parse(address, &resolved)?;
-        #[cfg(feature = "java")]
-        let full_result =
-            engine::full(&self.parts(), &parsed, &resolved, self.srv_resolver()).await;
-        #[cfg(not(feature = "java"))]
-        let full_result = engine::full(&self.parts(), &parsed, &resolved).await;
-        full_result
+        if self.inner.merge_in_flight {
+            let deadline = Instant::now()
+                .checked_add(resolved.timeout)
+                .ok_or(Error::InvalidInput("query timeout is too large"))?;
+            let key = flight_key(&parsed, &resolved);
+            let parts = self.parts();
+            // `SrvResolver` is `()` without the `java` feature; cloning the
+            // unit placeholder is intentional and harmless in that build.
+            #[allow(clippy::let_unit_value, clippy::clone_on_copy)]
+            let srv_resolver = self.srv_resolver().clone();
+            #[allow(clippy::let_unit_value, clippy::clone_on_copy)]
+            let probe = Arc::new(move || {
+                let parts = parts.clone();
+                let parsed = parsed.clone();
+                let resolved = resolved.clone();
+                #[allow(clippy::let_unit_value, clippy::clone_on_copy)]
+                let srv_resolver = srv_resolver.clone();
+                Box::pin(
+                    async move { engine::full(&parts, &parsed, &resolved, &srv_resolver).await },
+                ) as Pin<Box<dyn Future<Output = Result<Status, Error>> + Send>>
+            });
+            return self.merged_probe(&key, deadline, probe).await;
+        }
+        engine::full(&self.parts(), &parsed, &resolved, self.srv_resolver()).await
     }
 
     /// Query a Java Edition server address.
@@ -412,8 +460,8 @@ impl Client {
     }
 
     /// Shared SRV resolver used by this client's Java queries.
-    #[cfg(feature = "java")]
-    pub(crate) fn srv_resolver(&self) -> &hickory_resolver::TokioResolver {
+    #[must_use]
+    pub(crate) fn srv_resolver(&self) -> &SrvResolver {
         &self.inner.resolver
     }
 
@@ -432,13 +480,15 @@ impl Client {
     }
 
     #[allow(clippy::unused_self)] // the borrowed resources differ per feature set
-    fn parts(&self) -> Parts<'_> {
+    fn parts(&self) -> Parts {
         Parts {
-            _lifetime: std::marker::PhantomData,
             #[cfg(feature = "bedrock")]
-            cache: &self.inner.cache,
+            cache: Arc::clone(&self.inner.cache),
             #[cfg(feature = "nethernet")]
-            http: &self.inner.http,
+            http: self.inner.http.clone(),
+            #[allow(clippy::clone_on_copy, clippy::unit_arg)]
+            resolver: self.inner.resolver.clone(),
+            in_flight: Arc::clone(&self.inner.in_flight),
         }
     }
 
@@ -453,6 +503,8 @@ pub struct ClientBuilder {
     options: QueryOptions,
     #[cfg(feature = "bedrock")]
     cache_capacity: usize,
+    merge_in_flight: bool,
+    max_in_flight: Option<usize>,
 }
 
 #[allow(clippy::derivable_impls)] // not derivable when the bedrock feature adds cache_capacity
@@ -462,6 +514,8 @@ impl Default for ClientBuilder {
             options: QueryOptions::default(),
             #[cfg(feature = "bedrock")]
             cache_capacity: DEFAULT_CACHE_CAPACITY,
+            merge_in_flight: false,
+            max_in_flight: None,
         }
     }
 }
@@ -524,6 +578,30 @@ impl ClientBuilder {
         self
     }
 
+    /// Merge concurrent identical queries into one shared probe.
+    ///
+    /// When several callers query the same address with the same effective
+    /// options at the same time, only one probe runs and every waiter
+    /// receives its result. Each caller keeps its own deadline: a waiter
+    /// whose deadline expires simply re-probes independently.
+    ///
+    /// Defaults to disabled.
+    #[must_use]
+    pub fn merge_in_flight(mut self, merge: bool) -> Self {
+        self.merge_in_flight = merge;
+        self
+    }
+
+    /// Bound the number of probes this client runs concurrently.
+    ///
+    /// Queued callers wait inside their own query deadline. `None` (the
+    /// default) leaves concurrency unbounded.
+    #[must_use]
+    pub fn max_in_flight(mut self, max_in_flight: usize) -> Self {
+        self.max_in_flight = Some(max_in_flight);
+        self
+    }
+
     /// Build the client.
     ///
     /// # Errors
@@ -534,23 +612,56 @@ impl ClientBuilder {
     pub fn build(self) -> std::result::Result<Client, crate::error::Error> {
         #[cfg(feature = "nethernet")]
         let http = crate::bedrock::nethernet::build_http_client()?;
-        #[cfg(feature = "java")]
-        let resolver = hickory_resolver::Resolver::builder_tokio()
-            .map_err(|error| crate::error::Error::Dns(error.to_string()))?
-            .build()
-            .map_err(|error| crate::error::Error::Dns(error.to_string()))?;
+        #[allow(clippy::let_unit_value)]
+        let resolver = build_srv_resolver()?;
         Ok(Client {
             inner: Arc::new(ClientInner {
                 options: self.options,
                 #[cfg(feature = "bedrock")]
-                cache: TransportCache::new(self.cache_capacity),
+                cache: Arc::new(TransportCache::new(self.cache_capacity)),
                 #[cfg(feature = "nethernet")]
                 http,
-                #[cfg(feature = "java")]
                 resolver,
+                in_flight: Arc::new(tokio::sync::Semaphore::new(
+                    self.max_in_flight
+                        .unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
+                )),
+                flights: Arc::new(Mutex::new(HashMap::new())),
+                merge_in_flight: self.merge_in_flight,
             }),
         })
     }
+}
+
+/// Build the singleflight key for a merged query: everything that changes
+/// the probe's outcome except the per-caller deadline.
+fn flight_key(address: &ServerAddress, resolved: &ResolvedOptions) -> String {
+    format!(
+        "{}|{}|{}|{:?}|{}|{}|{}|{}",
+        address.host,
+        resolved.java_port,
+        resolved.bedrock_port,
+        resolved.edition,
+        resolved.try_srv,
+        resolved.allow_insecure_http,
+        resolved.max_response_bytes,
+        resolved.max_java_status_bytes,
+    )
+}
+
+/// Build the client's SRV resolver: hickory when the `java` feature is
+/// compiled in, and a unit placeholder otherwise.
+#[allow(clippy::unnecessary_wraps)]
+fn build_srv_resolver() -> Result<SrvResolver, crate::error::Error> {
+    #[cfg(feature = "java")]
+    {
+        hickory_resolver::Resolver::builder_tokio()
+            .map_err(|error| crate::error::Error::Dns(error.to_string()))?
+            .build()
+            .map_err(|error| crate::error::Error::Dns(error.to_string()))
+    }
+    #[cfg(not(feature = "java"))]
+    Ok(())
 }
 
 static DEFAULT_CLIENT: OnceLock<std::result::Result<Client, String>> = OnceLock::new();
@@ -560,6 +671,117 @@ pub(crate) fn default_client() -> std::result::Result<&'static Client, crate::er
         .get_or_init(|| Client::builder().build().map_err(|error| error.to_string()))
         .as_ref()
         .map_err(|message| crate::error::Error::Http(message.clone()))
+}
+
+/// Handle to the client's SRV resolver: the hickory resolver when the
+/// `java` feature is compiled in, and a unit placeholder otherwise.
+#[cfg(feature = "java")]
+pub(crate) type SrvResolver = hickory_resolver::TokioResolver;
+#[cfg(not(feature = "java"))]
+pub(crate) type SrvResolver = ();
+
+/// Probe factory: builds a fresh merged-probe future on each call.
+pub(crate) type ProbeFactory = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = Result<Status, Error>> + Send>> + Send + Sync,
+>;
+
+/// One merged in-flight probe shared by concurrent identical callers.
+pub(crate) struct Flight {
+    /// Woken when the shared probe finishes.
+    pub(crate) notify: tokio::sync::Notify,
+    /// The shared outcome, set exactly once when the probe finishes.
+    pub(crate) slot: Mutex<Option<Arc<Result<Status, Error>>>>,
+    /// Whether a caller has claimed ownership of running the probe.
+    claimed: std::sync::atomic::AtomicBool,
+}
+
+impl Client {
+    /// Run `probe` merged with concurrent identical callers when merging is
+    /// enabled. The first caller spawns the shared probe (so its own
+    /// cancellation cannot cancel it for the others); the rest wait for the
+    /// shared result within their own deadline and, on failure, re-probe
+    /// independently.
+    async fn merged_probe(
+        &self,
+        key: &str,
+        deadline: Instant,
+        probe: ProbeFactory,
+    ) -> Result<Status, Error> {
+        use std::sync::atomic::Ordering;
+
+        let entry = {
+            let mut flights = self.inner.flights.lock().expect("flights lock poisoned");
+            flights
+                .entry(key.to_string())
+                .or_insert_with(|| {
+                    Arc::new(Flight {
+                        notify: tokio::sync::Notify::new(),
+                        slot: Mutex::new(None),
+                        claimed: std::sync::atomic::AtomicBool::new(false),
+                    })
+                })
+                .clone()
+        };
+
+        let shared = entry.slot.lock().expect("slot lock poisoned").clone();
+        if let Some(shared) = shared {
+            return match shared.as_ref() {
+                Ok(status) => Ok(status.clone()),
+                // The shared probe failed; re-probe independently so each
+                // caller gets a genuine attempt at the server.
+                Err(_) => probe().await,
+            };
+        }
+
+        let is_owner = !entry.claimed.swap(true, Ordering::SeqCst);
+        if is_owner {
+            // Spawn the probe so this caller's cancellation cannot cancel the
+            // shared probe for other waiters. The spawned task stores the
+            // result, removes the flight entry, and wakes all waiters.
+            let probe_entry = Arc::clone(&entry);
+            let probe_flights = Arc::clone(&self.inner.flights);
+            let probe_key = key.to_string();
+            let probe = Arc::clone(&probe);
+            tokio::spawn(async move {
+                let outcome = Arc::new(probe().await);
+                *probe_entry.slot.lock().expect("slot lock poisoned") = Some(outcome);
+                probe_flights
+                    .lock()
+                    .expect("flights lock poisoned")
+                    .remove(&probe_key);
+                probe_entry.notify.notify_waiters();
+            });
+
+            let remaining = engine::remaining(deadline)?;
+            match time::timeout(remaining, entry.notify.notified()).await {
+                Ok(()) => {}
+                // This caller's deadline expired while the shared probe is
+                // still running; other waiters will still receive it.
+                Err(_) => return Err(Error::Timeout),
+            }
+        } else {
+            let remaining = engine::remaining(deadline)?;
+            match time::timeout(remaining, entry.notify.notified()).await {
+                Ok(()) => {}
+                // This caller's deadline expired; it re-probes independently.
+                Err(_) => return probe().await,
+            }
+        }
+
+        // The probe finished; read the shared result. A failed shared probe
+        // triggers an independent re-probe for this caller.
+        let shared = entry.slot.lock().expect("slot lock poisoned").clone();
+        // Clean the entry so later queries start a fresh probe.
+        self.inner
+            .flights
+            .lock()
+            .expect("flights lock poisoned")
+            .remove(key);
+        match shared.as_ref().map(std::convert::AsRef::as_ref) {
+            Some(Ok(status)) => Ok(status.clone()),
+            _ => probe().await,
+        }
+    }
 }
 
 /// Internal query engine shared by the free functions and [`Client`].
@@ -572,7 +794,7 @@ pub(crate) mod engine {
     use tokio::net::lookup_host;
     use tokio::time;
 
-    use super::{Parts, ResolvedOptions};
+    use super::{Parts, ResolvedOptions, SrvResolver};
     use crate::address::ServerAddress;
     #[cfg(feature = "bedrock")]
     use crate::bedrock;
@@ -587,10 +809,10 @@ pub(crate) mod engine {
 
     /// Run a full query: honor the edition restriction, then race or restrict.
     pub(crate) async fn full(
-        parts: &Parts<'_>,
+        parts: &Parts,
         address: &ServerAddress,
         resolved: &ResolvedOptions,
-        #[cfg(feature = "java")] srv_resolver: &hickory_resolver::TokioResolver,
+        srv_resolver: &SrvResolver,
     ) -> Result<Status> {
         let started = Instant::now();
         let deadline = started
@@ -606,7 +828,7 @@ pub(crate) mod engine {
             #[cfg(all(feature = "java", not(feature = "bedrock")))]
             None => auto_probe(parts, address, resolved, deadline, srv_resolver).await,
             #[cfg(all(not(feature = "java"), feature = "bedrock"))]
-            None => auto_probe(parts, address, resolved, deadline).await,
+            None => auto_probe(parts, address, resolved, deadline, srv_resolver).await,
         };
         finish(started, result)
     }
@@ -614,7 +836,7 @@ pub(crate) mod engine {
     /// Run a Java-only query.
     #[cfg(feature = "java")]
     pub(crate) async fn java(
-        parts: &Parts<'_>,
+        parts: &Parts,
         address: &ServerAddress,
         resolved: &ResolvedOptions,
         srv_resolver: &hickory_resolver::TokioResolver,
@@ -633,7 +855,7 @@ pub(crate) mod engine {
     /// Run a Bedrock-only query with automatic transport selection.
     #[cfg(feature = "bedrock")]
     pub(crate) async fn bedrock(
-        parts: &Parts<'_>,
+        parts: &Parts,
         address: &ServerAddress,
         resolved: &ResolvedOptions,
     ) -> Result<Status> {
@@ -650,7 +872,7 @@ pub(crate) mod engine {
     /// Run a forced `RakNet` query; the transport error surfaces directly.
     #[cfg(feature = "bedrock")]
     pub(crate) async fn raknet(
-        parts: &Parts<'_>,
+        parts: &Parts,
         address: &ServerAddress,
         resolved: &ResolvedOptions,
     ) -> Result<Status> {
@@ -666,7 +888,7 @@ pub(crate) mod engine {
     /// Run a forced `NetherNet` query; the transport error surfaces directly.
     #[cfg(feature = "nethernet")]
     pub(crate) async fn nethernet(
-        parts: &Parts<'_>,
+        parts: &Parts,
         address: &ServerAddress,
         resolved: &ResolvedOptions,
     ) -> Result<Status> {
@@ -681,11 +903,11 @@ pub(crate) mod engine {
 
     /// Probe every compiled edition when no edition restriction is set.
     async fn auto_probe(
-        parts: &Parts<'_>,
+        parts: &Parts,
         address: &ServerAddress,
         resolved: &ResolvedOptions,
         deadline: Instant,
-        #[cfg(feature = "java")] srv_resolver: &hickory_resolver::TokioResolver,
+        srv_resolver: &SrvResolver,
     ) -> Result<Status> {
         let _ = parts;
         #[cfg(all(feature = "java", feature = "bedrock"))]
@@ -698,6 +920,8 @@ pub(crate) mod engine {
         }
         #[cfg(all(not(feature = "java"), feature = "bedrock"))]
         {
+            #[allow(clippy::ignored_unit_patterns)]
+            let () = srv_resolver;
             bedrock::run(parts, address, resolved, deadline).await
         }
     }
@@ -710,7 +934,7 @@ pub(crate) mod engine {
     /// Java side.
     #[cfg(all(feature = "java", feature = "bedrock"))]
     async fn java_then_bedrock(
-        parts: &Parts<'_>,
+        parts: &Parts,
         address: &ServerAddress,
         resolved: &ResolvedOptions,
         deadline: Instant,
@@ -1054,5 +1278,152 @@ mod tests {
             std::error::Error::source(&error).is_some(),
             "aggregate errors must connect to the original error chain"
         );
+    }
+}
+
+#[cfg(all(test, feature = "bedrock"))]
+mod concurrency_tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn merge_in_flight_shares_one_probe_for_concurrent_identical_queries() {
+        // Two concurrent queries with the same target/config share a single
+        // probe when merge_in_flight is enabled. A RakNet mock answers, so
+        // both callers get a successful status.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mock = spawn_pong_mock(hits.clone()).await;
+        let address = format!("{}:{}", mock.ip(), mock.port());
+
+        let client = Client::builder()
+            .merge_in_flight(true)
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("test client should build");
+
+        let first = {
+            let client = client.clone();
+            let address = address.clone();
+            tokio::spawn(async move { client.query(&address).await })
+        };
+        let second = {
+            let client = client.clone();
+            tokio::spawn(async move { client.query(&address).await })
+        };
+
+        let a = first
+            .await
+            .expect("task should finish")
+            .expect("first query should answer");
+        let b = second
+            .await
+            .expect("task should finish")
+            .expect("second query should answer");
+        assert_eq!(a.motd, "RakNet Mock");
+        assert_eq!(b.motd, "RakNet Mock");
+        assert_eq!(a.transport(), Transport::RakNetUdp);
+        assert_eq!(b.transport(), Transport::RakNetUdp);
+    }
+
+    #[tokio::test]
+    async fn max_in_flight_bounds_concurrent_probes() {
+        // A tight in-flight limit must not prevent queries from eventually
+        // completing; queued callers still wait inside their own deadline.
+        let mock = spawn_pong_mock(Arc::new(AtomicUsize::new(0))).await;
+        let address = format!("{}:{}", mock.ip(), mock.port());
+        let client = Client::builder()
+            .max_in_flight(1)
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("test client should build");
+
+        for _ in 0..3 {
+            let status = client
+                .query(&address)
+                .await
+                .expect("queued query should answer");
+            assert_eq!(status.motd, "RakNet Mock");
+        }
+    }
+
+    #[cfg(feature = "nethernet")]
+    #[tokio::test]
+    async fn insecure_http_cache_hit_respects_a_stricter_policy() {
+        let client = Client::builder()
+            .allow_insecure_http(true)
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("test client should build");
+
+        // Plant a cached plain-HTTP transport for a closed endpoint, then
+        // query the same client with insecure HTTP explicitly disabled.
+        // The cached HTTP hit must NOT be used: the probe must fail rather
+        // than silently returning a plain-HTTP answer.
+        client
+            .inner
+            .cache
+            .store("127.0.0.1", 1, Transport::NetherNetHttp);
+        let denied = QueryOptions::default().allow_insecure_http(false);
+        let error = client
+            .query_with("127.0.0.1:1", denied)
+            .await
+            .expect_err("a stricter policy must reject the cached HTTP hit");
+
+        let attempts = match &error {
+            Error::NoCompatibleBedrockServer { attempts, .. }
+            | Error::NoCompatibleServer { attempts, .. } => attempts,
+            other => panic!("expected an aggregate error, got {other:?}"),
+        };
+        // The failed race contains no successful plain-HTTP result: with the
+        // policy disabled, no attempt may use the cached insecure transport.
+        assert!(
+            !attempts
+                .iter()
+                .any(|attempt| attempt.transport == Transport::NetherNetHttp),
+            "cached plain-HTTP hit bypassed the policy: {attempts:?}"
+        );
+    }
+
+    /// Spawn a UDP socket that answers every unconnected ping with a pong
+    /// echoing the ping's timestamp, and count the received pings.
+    async fn spawn_pong_mock(hits: Arc<AtomicUsize>) -> SocketAddr {
+        use std::net::Ipv4Addr;
+        use tokio::net::UdpSocket;
+
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("mock socket should bind");
+        let address = socket.local_addr().expect("mock address should exist");
+        tokio::spawn(async move {
+            let mut buffer = [0_u8; 64];
+            loop {
+                let Ok((len, peer)) = socket.recv_from(&mut buffer).await else {
+                    return;
+                };
+                if len != 33 {
+                    return;
+                }
+                hits.fetch_add(1, Ordering::SeqCst);
+                let ping_time: [u8; 8] = buffer[1..9].try_into().expect("8 bytes");
+                let text = "MCPE;RakNet Mock;589;1.21.100;3;20;12345;Line2;Survival;1;19132;19133;";
+                let mut pong = Vec::with_capacity(35 + text.len());
+                pong.push(0x1c);
+                pong.extend_from_slice(&ping_time);
+                pong.extend_from_slice(&2_i64.to_be_bytes());
+                pong.extend_from_slice(&[
+                    0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12,
+                    0x34, 0x56, 0x78,
+                ]);
+                pong.extend_from_slice(
+                    &u16::try_from(text.len())
+                        .expect("fixture MOTD length fits in u16")
+                        .to_be_bytes(),
+                );
+                pong.extend_from_slice(text.as_bytes());
+                let _ = socket.send_to(&pong, peer).await;
+            }
+        });
+        address
     }
 }

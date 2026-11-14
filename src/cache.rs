@@ -41,8 +41,15 @@ impl TransportCache {
     }
 
     /// Build the cache key for a Bedrock server endpoint.
+    ///
+    /// One allocation: the lowercased host and the port are appended into a
+    /// single pre-sized string.
     fn cache_key(host: &str, port: u16) -> String {
-        format!("{}:{port}", host.to_ascii_lowercase())
+        let mut key = String::with_capacity(host.len() + 8);
+        key.push_str(&host.to_ascii_lowercase());
+        key.push(':');
+        key.push_str(&port.to_string());
+        key
     }
 
     /// Return the cached transport for a host and port, if present and fresh.

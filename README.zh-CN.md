@@ -119,7 +119,8 @@ let status = client
 - `timeout` 是端到端 deadline：SRV、DNS 与全部探测共享同一截止时间，而不是
   每个阶段各自重新计时。
 - Java 直连探测与所有 RakNet 传输路径都会在共享 deadline 内依次尝试所有
-  解析出的地址（IPv4 优先）。
+  解析出的地址（IPv4 优先）：每个候选平分剩余预算，SRV 目标层也单独分配
+  预算，单个静默目标不会饿死其他目标。
 - NetherNet HTTPS 跑在游戏端口上；只有在传输层失败且安全策略允许时
   （`allow_insecure_http`，默认开启）才回退一次明文 `http://`。收到任何
   HTTP 状态码都不会触发回退。

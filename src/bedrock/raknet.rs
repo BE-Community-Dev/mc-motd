@@ -134,14 +134,12 @@ async fn query_host(host: &str, port: u16, deadline: Instant) -> Result<RakNetDe
     let mut buffer = vec![0_u8; PONG_BUFFER_SIZE];
     let mut last = None;
     // Fair-share the shared deadline across the remaining addresses so a
-    // silently dropping first address cannot starve the failover candidates.
+    // silently dropping first address gets its slice and the remaining
+    // candidates split whatever is left.
     let mut attempts_left = addresses.len();
     for address in addresses {
         let remaining = crate::client::engine::remaining(deadline)?;
-        let share = remaining / u32::try_from(attempts_left).unwrap_or(u32::MAX);
-        // The floor is itself capped by the remaining deadline so a short
-        // total budget is never overshot by a single attempt.
-        let attempt_budget = share.max(crate::client::MIN_ATTEMPT_BUDGET.min(remaining));
+        let attempt_budget = remaining / u32::try_from(attempts_left).unwrap_or(u32::MAX);
         attempts_left = attempts_left.saturating_sub(1);
         match query_addr_into(address, &mut buffer, attempt_budget).await {
             Ok(pong) => return Ok(pong.to_owned()),
@@ -157,27 +155,25 @@ pub(crate) async fn probe(
     address: &ServerAddress,
     deadline: Instant,
     ips: &[IpAddr],
-    parts: &Parts<'_>,
+    parts: &Parts,
 ) -> Result<Status, Attempt> {
     let port = address.bedrock_port;
     let target = format!("{}:{}", address.host, port);
 
     let result: Result<RakNetDetails, Error> = async {
-        let mut buffer = vec![0_u8; PONG_BUFFER_SIZE];
         if ips.is_empty() {
             return query_host(&address.host, port, deadline).await;
         }
         // UDP has no fast failure signal, so every resolved address is tried
-        // in order with a fair share of the shared deadline; a silently
-        // dropping first address cannot starve the failover candidates.
+        // in order with a fair share of the shared deadline: a silently
+        // dropping first address gets its slice and the remaining candidates
+        // split whatever is left.
+        let mut buffer = vec![0_u8; PONG_BUFFER_SIZE];
         let mut last = None;
         let mut attempts_left = ips.len();
         for ip in ips {
             let remaining = crate::client::engine::remaining(deadline)?;
-            let share = remaining / u32::try_from(attempts_left).unwrap_or(u32::MAX);
-            // The floor is itself capped by the remaining deadline so a short
-            // total budget is never overshot by a single attempt.
-            let attempt_budget = share.max(crate::client::MIN_ATTEMPT_BUDGET.min(remaining));
+            let attempt_budget = remaining / u32::try_from(attempts_left).unwrap_or(u32::MAX);
             attempts_left = attempts_left.saturating_sub(1);
             match query_addr_into(SocketAddr::new(*ip, port), &mut buffer, attempt_budget).await {
                 Ok(pong) => return Ok(pong.to_owned()),

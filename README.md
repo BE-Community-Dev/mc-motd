@@ -132,7 +132,9 @@ Every successful query returns `Status`:
 - `timeout` is an end-to-end deadline: SRV lookup, DNS, and every probe share
   it instead of restarting it per stage.
 - Direct Java probes — and every RakNet transport path — try every resolved
-  address (IPv4 first) within the shared deadline before failing.
+  address (IPv4 first) within the shared deadline before failing. Each
+  candidate gets a fair share of the remaining budget, and SRV targets are
+  budgeted at their own layer so one silent target cannot starve the rest.
 - NetherNet HTTPS runs on the game port; a plain `http://` endpoint is only
   tried after a transport-level failure and when the insecure-HTTP policy
   allows it (`allow_insecure_http`, on by default). Receiving any HTTP status

@@ -14,7 +14,7 @@ pub use crate::status::NetherNetDetails;
 
 /// Borrowed fields of a `NetherNet` join response.
 ///
-/// String fields borrow from the input text via zero-copy deserialization, so
+/// String fields borrow from the input text via zero-copy deserialization (escaped strings still decode into fresh allocations), so
 /// parsing allocates nothing per field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

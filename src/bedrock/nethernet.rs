@@ -146,7 +146,7 @@ pub async fn query_url(url: &str, options: QueryOptions) -> Result<Status> {
 pub(crate) async fn probe(
     address: &ServerAddress,
     deadline: Instant,
-    parts: &Parts<'_>,
+    parts: &Parts,
     resolved: &ResolvedOptions,
     prefer_https: bool,
 ) -> Result<Status, Attempt> {
@@ -174,7 +174,7 @@ pub(crate) async fn probe(
     };
 
     let used_https;
-    let details = match probe_join(parts.http, &url, deadline, resolved, prefer_https).await {
+    let details = match probe_join(&parts.http, &url, deadline, resolved, prefer_https).await {
         Ok((details, scheme)) => {
             used_https = scheme;
             details
@@ -291,7 +291,14 @@ async fn fetch_join(
         ));
     }
 
-    let mut body = Vec::with_capacity(1024);
+    // Reserve based on a validated Content-Length when available so large
+    // responses do not repeatedly reallocate the buffer.
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .filter(|length| *length <= max_response_bytes as u64)
+            .map_or(1024, |length| usize::try_from(length).unwrap_or(1024)),
+    );
     while let Some(chunk) = response
         .chunk()
         .await
@@ -428,21 +435,34 @@ mod tests {
     #[tokio::test]
     #[ignore = "queries public Minecraft servers; run with --ignored"]
     async fn live_nethernet_servers_respond() {
-        for host in [
+        // Public servers fluctuate; require at least one of them to answer
+        // over verified HTTPS (plain HTTP fallback stays disabled).
+        let options = QueryOptions::default().timeout(Duration::from_secs(8));
+        let hosts = [
             "play.enchanted.gg",
             "nethernet.playhive.com",
             "mco.lbsg.net",
-        ] {
-            let status = query(format!("{host}:19132"))
-                .await
-                .unwrap_or_else(|error| panic!("{host} should answer NetherNet: {error}"));
-
-            assert!(!status.motd.is_empty(), "{host} should report a name");
-            assert!(
-                status.version.protocol.is_some(),
-                "{host} should report a protocol"
-            );
+        ];
+        let mut answered = 0;
+        let mut last_error = None;
+        for host in hosts {
+            match query_with(format!("{host}:19132"), options.clone()).await {
+                Ok(status) => {
+                    assert!(!status.motd.is_empty(), "{host} should report a name");
+                    assert!(
+                        status.version.protocol.is_some(),
+                        "{host} should report a protocol"
+                    );
+                    assert_eq!(status.transport(), Transport::NetherNetHttps);
+                    answered += 1;
+                }
+                Err(error) => last_error = Some((host, error)),
+            }
         }
+        assert!(
+            answered > 0,
+            "at least one NetherNet server should answer over HTTPS; last error: {last_error:?}"
+        );
     }
 
     /// Spawn a plain HTTP/1.1 mock server that answers `GET /v1/join` with the

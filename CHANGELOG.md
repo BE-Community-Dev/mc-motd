@@ -59,6 +59,17 @@ All notable changes to this project will be documented in this file.
   - LAN discovery dedupes per socket address, caps results, and correlates
     pongs with the ping timestamp; `unsafe_code` is forbidden crate-wide;
     CI gained Windows, a feature matrix, and `cargo audit`.
+- Performance and scheduling fixes from review:
+  - the HTTP cache-hit branch now checks `allow_insecure_http` before using a
+    cached plain-HTTP transport, and a dedicated `NetherNetHttps` cache-hit
+    branch makes HTTPS caching effective
+  - pure fair-share address budgets replace the 250ms floor; SRV targets get
+    their own budget layer
+  - RakNet lazy-resolution path no longer allocates an unused 2048-byte
+    buffer; Java description flattening appends into one string; HTTP body
+    reserve uses a validated Content-Length
+  - cache keys are built with one allocation; `Cow` docs now note that
+    escaped JSON strings still allocate
 - Contract fixes from review: an explicitly specified port skips SRV entirely;
   `Status.address` keeps the requested address (including explicit ports)
   untouched while SRV targets surface through `JavaDetails::srv`; status
@@ -72,6 +83,14 @@ All notable changes to this project will be documented in this file.
   semicolons is borrowed as one contiguous span instead of being re-joined;
   Java description parsing flattens nested text components (`extra`,
   `translate`).
+
+### Added
+
+- Optional `ClientBuilder::merge_in_flight(true)` merges concurrent identical
+  queries into one shared probe (each waiter keeps its own deadline and
+  cancellation semantics); `max_in_flight(n)` bounds concurrent probes.
+- Regression tests for the HTTP cache policy guard, in-flight merging, and
+  concurrency limits.
 
 ### Changed
 

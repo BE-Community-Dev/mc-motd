@@ -62,7 +62,7 @@ pub async fn query_with(address: impl AsRef<str>, options: QueryOptions) -> Resu
 pub(crate) async fn probe(
     address: &ServerAddress,
     deadline: Instant,
-    parts: &Parts<'_>,
+    parts: &Parts,
     resolved: &ResolvedOptions,
     ips: &[std::net::IpAddr],
 ) -> Result<Status, Vec<Attempt>> {
@@ -83,45 +83,42 @@ pub(crate) async fn probe(
 async fn probe_with_nethernet(
     address: &ServerAddress,
     deadline: Instant,
-    parts: &Parts<'_>,
+    parts: &Parts,
     resolved: &ResolvedOptions,
     ips: &[std::net::IpAddr],
 ) -> Result<Status, Vec<Attempt>> {
     let host = &address.host;
     let port = address.bedrock_port;
     match parts.cache.cached(host, port) {
-        Some(Transport::NetherNetHttp) => {
-            // Wait for the cached transport through a short grace window; if
-            // it has not answered by then (a server may have switched away
-            // from it), race it against the other transport so the cache
-            // cannot turn into a serial timeout.
+        // A cached plain-HTTP hit is only honored when the current query's
+        // policy still allows insecure HTTP; otherwise re-probe from the
+        // HTTPS-preferring race so the security setting cannot be bypassed
+        // through stale cache entries.
+        Some(Transport::NetherNetHttp) if resolved.allow_insecure_http => {
             let cached = async {
                 nethernet::probe(address, deadline, parts, resolved, false)
                     .await
                     .map_err(|attempt| vec![attempt])
             };
-            tokio::pin!(cached);
-            match time::timeout(crate::client::CACHE_GRACE, &mut cached).await {
-                Ok(Ok(status)) => Ok(status),
-                Ok(Err(mut first_attempts)) => {
-                    let second = raknet::probe(address, deadline, ips, parts).await;
-                    match second {
-                        Ok(status) => Ok(status),
-                        Err(second_attempt) => {
-                            first_attempts.push(second_attempt);
-                            Err(first_attempts)
-                        }
-                    }
-                }
-                Err(_) => {
-                    let fallback = async {
-                        raknet::probe(address, deadline, ips, parts)
-                            .await
-                            .map_err(|attempt| vec![attempt])
-                    };
-                    crate::client::engine::race_probe(&mut cached, fallback).await
-                }
-            }
+            cached_with_grace(cached, async {
+                raknet::probe(address, deadline, ips, parts)
+                    .await
+                    .map_err(|attempt| vec![attempt])
+            })
+            .await
+        }
+        Some(Transport::NetherNetHttps) => {
+            let cached = async {
+                nethernet::probe(address, deadline, parts, resolved, true)
+                    .await
+                    .map_err(|attempt| vec![attempt])
+            };
+            cached_with_grace(cached, async {
+                raknet::probe(address, deadline, ips, parts)
+                    .await
+                    .map_err(|attempt| vec![attempt])
+            })
+            .await
         }
         Some(Transport::RakNetUdp) => {
             let cached = async {
@@ -129,28 +126,12 @@ async fn probe_with_nethernet(
                     .await
                     .map_err(|attempt| vec![attempt])
             };
-            tokio::pin!(cached);
-            match time::timeout(crate::client::CACHE_GRACE, &mut cached).await {
-                Ok(Ok(status)) => Ok(status),
-                Ok(Err(mut first_attempts)) => {
-                    let second = nethernet::probe(address, deadline, parts, resolved, true).await;
-                    match second {
-                        Ok(status) => Ok(status),
-                        Err(second_attempt) => {
-                            first_attempts.push(second_attempt);
-                            Err(first_attempts)
-                        }
-                    }
-                }
-                Err(_) => {
-                    let fallback = async {
-                        nethernet::probe(address, deadline, parts, resolved, true)
-                            .await
-                            .map_err(|attempt| vec![attempt])
-                    };
-                    crate::client::engine::race_probe(&mut cached, fallback).await
-                }
-            }
+            cached_with_grace(cached, async {
+                nethernet::probe(address, deadline, parts, resolved, true)
+                    .await
+                    .map_err(|attempt| vec![attempt])
+            })
+            .await
         }
         _ => {
             let nether_future = async {
@@ -168,9 +149,36 @@ async fn probe_with_nethernet(
     }
 }
 
+/// Wait for the cached transport through a short grace window; if it has not
+/// answered by then (a server may have switched away from it), race it
+/// against the fallback so the cache cannot turn into a serial timeout. When
+/// both fail, every attempt is preserved in the aggregate error.
+#[cfg(feature = "nethernet")]
+async fn cached_with_grace<F>(
+    cached: impl Future<Output = Result<Status, Vec<Attempt>>>,
+    fallback: F,
+) -> Result<Status, Vec<Attempt>>
+where
+    F: Future<Output = Result<Status, Vec<Attempt>>>,
+{
+    tokio::pin!(cached);
+    tokio::pin!(fallback);
+    match time::timeout(crate::client::CACHE_GRACE, &mut cached).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(mut first_attempts)) => match fallback.await {
+            Ok(status) => Ok(status),
+            Err(mut second_attempts) => {
+                first_attempts.append(&mut second_attempts);
+                Err(first_attempts)
+            }
+        },
+        Err(_) => crate::client::engine::race_probe(&mut cached, &mut fallback).await,
+    }
+}
+
 /// Probe the Bedrock transports and wrap failures in the Bedrock-only error.
 pub(crate) async fn run(
-    parts: &Parts<'_>,
+    parts: &Parts,
     address: &ServerAddress,
     resolved: &ResolvedOptions,
     deadline: Instant,
