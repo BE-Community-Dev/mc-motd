@@ -32,16 +32,6 @@ pub struct SrvTarget {
     pub weight: u16,
 }
 
-/// Raw Java Edition status payload kept for advanced callers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct JavaQueryInfo {
-    /// Raw JSON returned by the server status endpoint.
-    pub raw_json: String,
-    /// SRV record the query was resolved through, if any.
-    pub srv: Option<SrvTarget>,
-}
-
 /// Query a Java Edition server address.
 ///
 /// The address may be `host`, `host:port`, or `[ipv6]:port`. Without an
@@ -110,10 +100,8 @@ pub async fn resolve_srv(host: impl AsRef<str>, timeout: Duration) -> Result<Vec
 }
 
 /// Order SRV records by priority with RFC 2782 weighted-random selection
-/// inside each priority class.
-///
-/// Zero-weight records receive a minimal ticket so they remain reachable,
-/// deviating slightly from the strict RFC reading.
+/// inside each priority class. Zero-weight records keep the lowest selection
+/// probability per the RFC and are only ordered once nothing else remains.
 fn weighted_srv_order(mut records: Vec<SrvTarget>) -> Vec<SrvTarget> {
     records.sort_by(|left, right| {
         left.priority
@@ -142,24 +130,37 @@ fn weighted_srv_order(mut records: Vec<SrvTarget>) -> Vec<SrvTarget> {
             .count();
         let mut group: Vec<SrvTarget> = records.drain(0..group_end).collect();
         while !group.is_empty() {
-            let total: u64 = group
-                .iter()
-                .map(|target| u64::from(target.weight) + 1)
-                .sum();
-            let mut point = random() % total;
-            let mut picked = 0;
-            for (position, target) in group.iter().enumerate() {
-                let tickets = u64::from(target.weight) + 1;
-                if point < tickets {
-                    picked = position;
-                    break;
+            // RFC 2782: sum the weights of the records yet to be ordered and
+            // pick the record whose range covers a uniform random point in
+            // [0, Sum). Zero-weight records own an empty range and are only
+            // selected once nothing else remains.
+            let total: u64 = group.iter().map(|target| u64::from(target.weight)).sum();
+            let picked = if total == 0 {
+                0
+            } else {
+                let mut point = random() % total;
+                let mut index = group.len() - 1;
+                for (position, target) in group.iter().enumerate() {
+                    if u64::from(target.weight) > point {
+                        index = position;
+                        break;
+                    }
+                    point -= u64::from(target.weight);
                 }
-                point -= tickets;
-            }
+                index
+            };
             ordered.push(group.remove(picked));
         }
     }
     ordered
+}
+
+/// Whether the SRV lookup should run for this address.
+///
+/// SRV applies only when the caller let the library choose the port (no
+/// explicit port), the option is enabled, and the host is a DNS name.
+fn srv_applicable(address: &ServerAddress, options: &QueryOptions) -> bool {
+    options.try_srv && address.explicit_port.is_none() && address::can_query_srv(&address.host)
 }
 
 /// Full Java path used by the engine: SRV records first, then direct.
@@ -170,7 +171,7 @@ pub(crate) async fn run(
 ) -> Result<Status> {
     let mut prefix_attempts: Vec<Attempt> = Vec::new();
 
-    if options.try_srv && address::can_query_srv(&address.host) {
+    if srv_applicable(address, options) {
         // Cap the SRV budget so a slow SRV path cannot starve direct probes.
         let srv_budget =
             crate::client::engine::remaining(deadline)?.min(crate::client::SRV_LOOKUP_BUDGET);
@@ -230,7 +231,7 @@ pub(crate) async fn probe_srv_sequence(
 ) -> Result<Status, Vec<Attempt>> {
     let mut attempts = Vec::new();
     for target in targets {
-        match probe_target(target, deadline).await {
+        match probe_target(address, target, deadline).await {
             Ok(status) => return Ok(status),
             Err(error) => attempts.push(Attempt {
                 transport: Transport::JavaTcp,
@@ -250,11 +251,28 @@ pub(crate) async fn probe_srv_sequence(
     }
 }
 
-/// Probe one SRV target; the target host is resolved internally.
-async fn probe_target(target: &SrvTarget, deadline: Instant) -> Result<Status, Error> {
+/// Probe one SRV target, trying every resolved address in order. The
+/// handshake speaks to the target while `Status.address` keeps the requested
+/// address and the SRV record lands in [`JavaDetails::srv`].
+async fn probe_target(
+    requested: &ServerAddress,
+    target: &SrvTarget,
+    deadline: Instant,
+) -> Result<Status, Error> {
     let ips = crate::client::engine::resolve_probe_ips(&target.host, deadline).await?;
-    let socket = SocketAddr::new(ips[0], target.port);
-    let mut status = query_socket(socket, &target.host, target.port, 0, deadline).await?;
+    let mut last = None;
+    for ip in ips {
+        let socket = SocketAddr::new(ip, target.port);
+        match query_socket(socket, &target.host, target.port, requested, deadline).await {
+            Ok(status) => return Ok(mark_srv(status, target)),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or(Error::ResolveFailed))
+}
+
+/// Stamp the SRV record onto a Java status payload.
+fn mark_srv(mut status: Status, target: &SrvTarget) -> Status {
     #[allow(irrefutable_let_patterns)]
     if let Status {
         details: Details::Java(details),
@@ -263,7 +281,7 @@ async fn probe_target(target: &SrvTarget, deadline: Instant) -> Result<Status, E
     {
         details.srv = Some(target.clone());
     }
-    Ok(status)
+    status
 }
 
 /// Probe the direct Java port, trying every resolved address in order until
@@ -293,15 +311,7 @@ pub(crate) async fn probe_direct(
 
     for ip in candidate_ips {
         let socket = SocketAddr::new(*ip, address.java_port);
-        match query_socket(
-            socket,
-            &address.host,
-            address.java_port,
-            address.bedrock_port,
-            deadline,
-        )
-        .await
-        {
+        match query_socket(socket, &address.host, address.java_port, address, deadline).await {
             Ok(status) => return Ok(status),
             Err(error) => attempts.push(Attempt {
                 transport: Transport::JavaTcp,
@@ -318,7 +328,7 @@ async fn query_socket(
     socket: SocketAddr,
     host: &str,
     port: u16,
-    bedrock_port: u16,
+    requested: &ServerAddress,
     deadline: Instant,
 ) -> Result<Status, Error> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -358,15 +368,14 @@ async fn query_socket(
     .await
     .map_err(|_| Error::Timeout)??;
 
-    let raw_json = codec::parse_status_response(&packet)?.to_string();
-    let address = ServerAddress {
-        host: host.to_string(),
-        java_port: port,
-        bedrock_port,
-        explicit_port: None,
-    };
+    let raw_json = codec::parse_status_response(&packet)?.to_owned();
+    // A well-formed status packet carrying garbage is a protocol failure, not
+    // a blank server: without this check automatic probing would stop at a
+    // broken Java response. Missing optional fields stay lenient.
+    serde_json::from_str::<serde_json::Value>(&raw_json)
+        .map_err(|_| Error::InvalidPacket("Java status JSON is not valid JSON"))?;
     Ok(Status::from_details(
-        address,
+        requested.clone(),
         Details::Java(JavaDetails {
             raw_json,
             srv: None,
@@ -417,16 +426,196 @@ pub(crate) fn extract_java_fields(raw_json: &str) -> (String, Players, Version) 
     (motd, players, version)
 }
 
-/// Flatten a Java description component (string or `{"text": ...}` object)
-/// into plain text.
+/// Flatten a Java description component into plain text.
+///
+/// Handles plain strings, text components (`text` plus nested `extra` arrays
+/// and `translate` fallbacks), and arrays of components. Anything else is
+/// rendered as its JSON form; there is no legacy color-code stripping.
 fn describe(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Object(object) => object
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .map_or_else(|| value.to_string(), ToString::to_string),
+        serde_json::Value::Array(components) => components.iter().map(describe).collect::<String>(),
+        serde_json::Value::Object(object) => {
+            let mut text = object
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(String::new, ToString::to_string);
+            if text.is_empty() {
+                if let Some(translated) =
+                    object.get("translate").and_then(serde_json::Value::as_str)
+                {
+                    text.push_str(translated);
+                }
+            }
+            if let Some(extra) = object.get("extra").and_then(serde_json::Value::as_array) {
+                for component in extra {
+                    text.push_str(&describe(component));
+                }
+            }
+            text
+        }
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::net::Ipv4Addr;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn srv_rules() {
+        let options = QueryOptions::default();
+        let mut address = crate::address::parse_server_address("play.example.com", 25_565, 19_132)
+            .expect("address should parse");
+        assert!(srv_applicable(&address, &options));
+
+        // An explicit port pins the endpoint: no SRV.
+        address = crate::address::parse_server_address("play.example.com:25566", 25_565, 19_132)
+            .expect("address should parse");
+        assert!(!srv_applicable(&address, &options));
+
+        // IP literals never have SRV records.
+        address = crate::address::parse_server_address("127.0.0.1", 25_565, 19_132)
+            .expect("address should parse");
+        assert!(!srv_applicable(&address, &options));
+
+        // The option can disable SRV entirely.
+        address = crate::address::parse_server_address("play.example.com", 25_565, 19_132)
+            .expect("address should parse");
+        assert!(!srv_applicable(&address, &options.try_srv(false)));
+    }
+
+    #[test]
+    fn weighted_srv_order_is_strict_rfc_2782() {
+        // A record with a large weight is always picked before zero-weight
+        // records, whose empty range only yields once nothing else remains.
+        let records = vec![
+            SrvTarget {
+                host: "heavy.example.com".into(),
+                port: 25_565,
+                priority: 0,
+                weight: 100,
+            },
+            SrvTarget {
+                host: "light.example.com".into(),
+                port: 25_565,
+                priority: 0,
+                weight: 0,
+            },
+        ];
+        let ordered = weighted_srv_order(records);
+        assert_eq!(ordered[0].host, "heavy.example.com");
+
+        // All-zero weights keep a deterministic order.
+        let records = vec![
+            SrvTarget {
+                host: "a.example.com".into(),
+                port: 25_565,
+                priority: 0,
+                weight: 0,
+            },
+            SrvTarget {
+                host: "b.example.com".into(),
+                port: 25_565,
+                priority: 0,
+                weight: 0,
+            },
+        ];
+        let ordered = weighted_srv_order(records);
+        assert_eq!(ordered[0].host, "a.example.com");
+        assert_eq!(ordered[1].host, "b.example.com");
+    }
+
+    #[test]
+    fn describe_flattens_nested_components() {
+        let json = r#"{"description":{"text":"Hello ","extra":[{"text":"World"},{"translate":"key.menu"}]},"players":{"online":1,"max":20},"version":{"name":"1.21.4","protocol":763}}"#;
+        let (motd, players, version) = extract_java_fields(json);
+
+        assert_eq!(motd, "Hello Worldkey.menu");
+        assert_eq!(players.online, Some(1));
+        assert_eq!(players.max, Some(20));
+        assert_eq!(version.name.as_deref(), Some("1.21.4"));
+        assert_eq!(version.protocol, Some(763));
+    }
+
+    #[tokio::test]
+    async fn invalid_json_fails_the_query() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("mock listener should bind");
+        let address = listener.local_addr().expect("mock address should exist");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let mut request = [0_u8; 256];
+            let _ = stream.read(&mut request).await;
+
+            // Well-formed status frame carrying garbage JSON.
+            let body = b"this is not json";
+            let mut packet = vec![0x00];
+            packet.push(u8::try_from(body.len()).expect("length fits in u8"));
+            packet.extend_from_slice(body);
+            let mut frame = vec![u8::try_from(packet.len()).expect("length fits in u8")];
+            frame.extend_from_slice(&packet);
+            let _ = stream.write_all(&frame).await;
+        });
+
+        let error = query(format!("127.0.0.1:{}", address.port()))
+            .await
+            .expect_err("invalid JSON should fail the query");
+
+        // Automatic probing wraps the probe failure; the inner error must be
+        // the invalid-packet failure.
+        let Error::NoCompatibleJavaServer { attempts, .. } = &error else {
+            panic!("expected a Java aggregate error, got {error:?}");
+        };
+        assert!(
+            matches!(
+                attempts[0].error.as_ref(),
+                Error::InvalidPacket("Java status JSON is not valid JSON")
+            ),
+            "inner failure should be the invalid JSON, got {:?}",
+            attempts[0].error
+        );
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[tokio::test]
+    async fn explicit_port_status_keeps_the_requested_address() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("mock listener should bind");
+        let address = listener.local_addr().expect("mock address should exist");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let mut request = [0_u8; 256];
+            let _ = stream.read(&mut request).await;
+
+            let json = r#"{"description":"Mock","players":{"online":1,"max":20},"version":{"name":"1.21.4","protocol":763}}"#;
+            let body = json.as_bytes();
+            let mut packet = vec![0x00];
+            packet.push(u8::try_from(body.len()).expect("length fits in u8"));
+            packet.extend_from_slice(body);
+            let mut frame = vec![u8::try_from(packet.len()).expect("length fits in u8")];
+            frame.extend_from_slice(&packet);
+            let _ = stream.write_all(&frame).await;
+        });
+
+        let status = query(format!("127.0.0.1:{}", address.port()))
+            .await
+            .expect("mock java server should answer");
+
+        // The requested address (including the explicit port) is preserved.
+        assert_eq!(status.address.host, "127.0.0.1");
+        assert_eq!(status.address.java_port, address.port());
+        assert_eq!(status.address.explicit_port, Some(address.port()));
+        assert_eq!(status.motd, "Mock");
+        assert_eq!(status.players.online, Some(1));
+        assert_eq!(status.version.protocol, Some(763));
     }
 }

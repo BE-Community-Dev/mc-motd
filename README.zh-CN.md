@@ -72,7 +72,8 @@ let java = client.java("mc.example.com").await?;
 ```
 
 `Client` 克隆成本极低，多个异步任务可以共享同一实例。单次查询的临时配置使用
-`Client::query_with(address, QueryOptions)`，选项支持链式调用：
+`Client::query_with(address, QueryOptions)`——链式选项**叠加在**客户端默认值
+之上，因此只为修改 timeout 而创建的临时选项不会重置 builder 中的端口与策略：
 
 ```rust
 use std::time::Duration;
@@ -105,21 +106,27 @@ let status = client
 
 ## 查询行为
 
-- 自动探测并发轮询 Java 与 Bedrock，host 只解析一次并共享；第一个成功响应直接
-  返回，平手时 Java 优先。存在 SRV 记录时对 Java 侧保持权威。
+- 自动探测并发轮询 Java 与 Bedrock，且两侧立即启动：Java 在自己的探测内处理
+  SRV（预算封顶 1 秒）与 DNS 解析，Bedrock 竞速以 NetherNet（独立解析栈）先行、
+  RakNet 惰性解析并行展开。任何串行的 SRV/DNS 阶段都不会延迟已经就绪的传输。
+  第一个成功响应直接返回，平手时 Java 优先；存在 SRV 记录时对 Java 侧保持权威。
 - Bedrock 内部 RakNet 与 NetherNet 探测并发竞速：更快的传输直接胜出，平手时
-  NetherNet 优先。
+  NetherNet 优先。命中缓存的传输先行探测，若它与回退传输都失败，聚合错误会
+  保留两次探测的失败。
 - 成功应答的传输类型按 `host:port` 缓存在所属 `Client` 内（10 分钟 TTL、有界
   容量），后续查询跳过失败探测。`client.cached_transport()` 与
   `client.clear_transport_cache()` 提供读写入口。
 - `timeout` 是端到端 deadline：SRV、DNS 与全部探测共享同一截止时间，而不是
   每个阶段各自重新计时。
-- Java 直连探测会依次尝试所有解析出的地址（IPv4 优先）。
+- Java 直连探测与所有 RakNet 传输路径都会在共享 deadline 内依次尝试所有
+  解析出的地址（IPv4 优先）。
 - NetherNet HTTPS 跑在游戏端口上；只有在传输层失败且安全策略允许时
   （`allow_insecure_http`，默认开启）才回退一次明文 `http://`。收到任何
   HTTP 状态码都不会触发回退。
-- SRV 记录按优先级排序，同优先级内使用 RFC 2782 加权随机选择（零权重记录
-  保留最小票数）。
+- SRV 记录按优先级排序，同优先级内使用 RFC 2782 加权随机选择；零权重记录的
+  区间为空，只有在没有其他记录时才会被排序。显式指定端口时完全跳过 SRV。
+- 状态包中 JSON 无法解析属于协议错误（`Error::InvalidPacket`），不会产生空白
+  状态；缺失的可选字段保持宽容。
 
 ## 协议层
 
@@ -135,9 +142,11 @@ mc_motd::protocol::bedrock::nethernet::parse_join(...)
 
 - `bedrock::raknet::query_addr_into(address, buffer, timeout)` 把 pong 读入
   调用方缓冲区并返回借用的 `RakNetDetailsRef`；跨多次轮询复用一个缓冲区即可
-  保持稳态零分配。
+  保持稳态零显式分配（socket 创建等运行时内部行为除外）。connect、send、
+  receive 共享同一条 deadline。
 - `protocol::bedrock::raknet::decode_pong` 与 `decode_motd_text` 解析为借用的
-  `Cow` 字段；仅当第一行 MOTD 包含分号需要重新拼接时才分配。
+  `Cow` 字段，全程无堆分配：含分号的首行 MOTD 是输入中的一段连续字节区间，
+  直接整体借用。
 - `protocol::bedrock::nethernet::parse_join_ref` 通过 `#[serde(borrow)]` 把
   join JSON 反序列化为借用的 `Cow` 字段。
 

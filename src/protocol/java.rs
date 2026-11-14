@@ -3,8 +3,6 @@
 //! Pure encoding and decoding of the Minecraft Java status handshake: no
 //! sockets, no timeouts. The network flow lives in [`crate::java`].
 
-use std::borrow::Cow;
-
 use crate::error::Error;
 
 const STATUS_STATE: i32 = 1;
@@ -51,7 +49,7 @@ pub fn encode_status_request(host: &str, port: u16, protocol_version: i32) -> Ve
 /// Returns [`Error`] if the packet id is not a status response, any `VarInt`
 /// is truncated or too long, the JSON length is invalid, or the JSON bytes are
 /// not valid UTF-8.
-pub fn parse_status_response(packet: &[u8]) -> Result<Cow<'_, str>, Error> {
+pub fn parse_status_response(packet: &[u8]) -> Result<&str, Error> {
     let mut cursor = 0;
     let packet_id = read_varint_from_slice(packet, &mut cursor)?;
     if packet_id != STATUS_REQUEST_PACKET_ID {
@@ -72,9 +70,7 @@ pub fn parse_status_response(packet: &[u8]) -> Result<Cow<'_, str>, Error> {
         ));
     }
 
-    Ok(Cow::Borrowed(std::str::from_utf8(
-        &packet[cursor..json_end],
-    )?))
+    std::str::from_utf8(&packet[cursor..json_end]).map_err(Error::from)
 }
 
 /// Maximum accepted Java status packet length.

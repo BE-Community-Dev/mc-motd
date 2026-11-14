@@ -278,7 +278,7 @@ mod tests {
 
         assert_eq!(status.motd, "FROSTBITE EVENT ★");
         assert_eq!(status.version.protocol, Some(2225));
-        assert_eq!(status.transport(), Some(Transport::NetherNetHttp));
+        assert_eq!(status.transport(), Transport::NetherNetHttp);
     }
 
     #[tokio::test]

@@ -89,21 +89,21 @@ pub enum Details {
 impl Details {
     /// Edition that produced these details.
     #[must_use]
-    pub fn edition(&self) -> Option<Edition> {
+    pub fn edition(&self) -> Edition {
         match self {
             #[cfg(feature = "java")]
-            Self::Java(_) => Some(Edition::Java),
+            Self::Java(_) => Edition::Java,
             #[cfg(feature = "bedrock")]
-            Self::Bedrock(_) => Some(Edition::Bedrock),
+            Self::Bedrock(_) => Edition::Bedrock,
         }
     }
 
     /// Transport that produced these details.
     #[must_use]
-    pub fn transport(&self) -> Option<Transport> {
+    pub fn transport(&self) -> Transport {
         match self {
             #[cfg(feature = "java")]
-            Self::Java(_) => Some(Transport::JavaTcp),
+            Self::Java(_) => Transport::JavaTcp,
             #[cfg(feature = "bedrock")]
             Self::Bedrock(details) => details.transport(),
         }
@@ -137,11 +137,11 @@ pub enum BedrockDetails {
 impl BedrockDetails {
     /// Transport that produced these details.
     #[must_use]
-    pub fn transport(&self) -> Option<Transport> {
+    pub fn transport(&self) -> Transport {
         match self {
-            Self::RakNet(_) => Some(Transport::RakNetUdp),
+            Self::RakNet(_) => Transport::RakNetUdp,
             #[cfg(feature = "nethernet")]
-            Self::NetherNet(_) => Some(Transport::NetherNetHttp),
+            Self::NetherNet(_) => Transport::NetherNetHttp,
         }
     }
 }
@@ -240,13 +240,13 @@ pub struct Status {
 impl Status {
     /// Edition that answered the query.
     #[must_use]
-    pub fn edition(&self) -> Option<Edition> {
+    pub fn edition(&self) -> Edition {
         self.details.edition()
     }
 
     /// Transport that answered the query.
     #[must_use]
-    pub fn transport(&self) -> Option<Transport> {
+    pub fn transport(&self) -> Transport {
         self.details.transport()
     }
 

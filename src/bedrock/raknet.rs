@@ -71,25 +71,41 @@ pub async fn query_addr_into(
             "pong buffer must hold at least 35 bytes",
         ));
     }
+    let deadline = Instant::now() + timeout;
     let bind_address = if address.is_ipv4() {
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
     } else {
         SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
     };
     let socket = UdpSocket::bind(bind_address).await?;
-    socket.connect(address).await?;
+    time::timeout(
+        crate::client::engine::remaining(deadline)?,
+        socket.connect(address),
+    )
+    .await
+    .map_err(|_| Error::Timeout)??;
 
     let ping = codec::encode_ping();
-    socket.send(&ping).await?;
+    time::timeout(
+        crate::client::engine::remaining(deadline)?,
+        socket.send(&ping),
+    )
+    .await
+    .map_err(|_| Error::Timeout)??;
 
-    let len = time::timeout(timeout, socket.recv(&mut buffer[..]))
-        .await
-        .map_err(|_| Error::Timeout)??;
+    let len = time::timeout(
+        crate::client::engine::remaining(deadline)?,
+        socket.recv(&mut buffer[..]),
+    )
+    .await
+    .map_err(|_| Error::Timeout)??;
 
     codec::decode_pong(&buffer[..len])
 }
 
 /// Query a host over `RakNet`, resolving it first.
+/// Query a host over `RakNet`, resolving it first and trying every resolved
+/// address in order (IPv4 first) within the shared deadline.
 async fn query_host(host: &str, port: u16, deadline: Instant) -> Result<RakNetDetails, Error> {
     let remaining = crate::client::engine::remaining(deadline)?;
     let mut resolved = time::timeout(remaining, lookup_host((host, port)))
@@ -98,13 +114,17 @@ async fn query_host(host: &str, port: u16, deadline: Instant) -> Result<RakNetDe
     // Prefer IPv4 addresses; Bedrock servers are most reliably reached there.
     let mut addresses: Vec<SocketAddr> = resolved.by_ref().collect();
     addresses.sort_by_key(|addr| i32::from(!addr.is_ipv4()));
-    let address = addresses.first().ok_or(Error::ResolveFailed)?.to_owned();
 
     let mut buffer = vec![0_u8; PONG_BUFFER_SIZE];
-    let remaining = crate::client::engine::remaining(deadline)?;
-    Ok(query_addr_into(address, &mut buffer, remaining)
-        .await?
-        .to_owned())
+    let mut last = None;
+    for address in addresses {
+        let remaining = crate::client::engine::remaining(deadline)?;
+        match query_addr_into(address, &mut buffer, remaining).await {
+            Ok(pong) => return Ok(pong.to_owned()),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or(Error::ResolveFailed))
 }
 
 /// Probe the `RakNet` transport for the engine, caching the transport on
@@ -112,25 +132,28 @@ async fn query_host(host: &str, port: u16, deadline: Instant) -> Result<RakNetDe
 pub(crate) async fn probe(
     address: &ServerAddress,
     deadline: Instant,
-    resolved: Option<IpAddr>,
+    ips: &[IpAddr],
     parts: &Parts<'_>,
 ) -> Result<Status, Attempt> {
     let port = address.bedrock_port;
     let target = format!("{}:{}", address.host, port);
 
     let result: Result<RakNetDetails, Error> = async {
-        match resolved {
-            Some(ip) => {
-                let mut buffer = vec![0_u8; PONG_BUFFER_SIZE];
-                let remaining = crate::client::engine::remaining(deadline)?;
-                Ok(
-                    query_addr_into(SocketAddr::new(ip, port), &mut buffer, remaining)
-                        .await?
-                        .to_owned(),
-                )
-            }
-            None => query_host(&address.host, port, deadline).await,
+        let mut buffer = vec![0_u8; PONG_BUFFER_SIZE];
+        if ips.is_empty() {
+            return query_host(&address.host, port, deadline).await;
         }
+        // UDP has no fast failure signal, so every resolved address is tried
+        // in order until one answers or the shared deadline runs out.
+        let mut last = None;
+        for ip in ips {
+            let remaining = crate::client::engine::remaining(deadline)?;
+            match query_addr_into(SocketAddr::new(*ip, port), &mut buffer, remaining).await {
+                Ok(pong) => return Ok(pong.to_owned()),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or(Error::ResolveFailed))
     }
     .await;
 
@@ -244,7 +267,7 @@ mod tests {
         assert_eq!(status.version.protocol, Some(589));
         assert_eq!(status.players.online, Some(3));
         assert_eq!(status.players.max, Some(20));
-        assert_eq!(status.transport(), Some(Transport::RakNetUdp));
+        assert_eq!(status.transport(), Transport::RakNetUdp);
         #[allow(irrefutable_let_patterns)]
         if let Details::Bedrock(BedrockDetails::RakNet(details)) = &status.details {
             assert_eq!(details.server_id, "12345");

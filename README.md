@@ -75,7 +75,8 @@ let java = client.java("mc.example.com").await?;
 
 `Client` is cheap to clone and shares its resources across tasks. For
 one-off configuration use `Client::query_with(address, QueryOptions)` — the
-options are chainable:
+chainable options are applied **on top of** the client defaults, so a per-query
+`timeout` keeps the builder's ports and policies:
 
 ```rust
 use std::time::Duration;
@@ -110,25 +111,36 @@ Every successful query returns `Status`:
 
 ## Query behavior
 
-- Automatic probing polls Java and Bedrock probes in parallel with a single
-  shared DNS resolution; the first compatible response wins and Java is
-  preferred on a tie. SRV records, when present, stay authoritative for the
-  Java side.
+- Automatic probing polls Java and Bedrock probes in parallel and both sides
+  start immediately: Java handles SRV (budget-capped to one second) and its
+  DNS resolution inside its own probe, and the Bedrock race starts with
+  NetherNet on its own resolver stack while RakNet resolves lazily. No serial
+  SRV/DNS phase delays a transport that is ready to answer. The first
+  compatible response wins and Java is preferred on a tie; SRV records, when
+  present, stay authoritative for the Java side.
 - Inside the Bedrock step the RakNet and NetherNet probes race concurrently;
-  the faster transport wins and NetherNet is preferred on ties.
+  the faster transport wins and NetherNet is preferred on ties. A cached
+  transport is tried first, and when the cached transport plus the fallback
+  both fail, the aggregate error keeps both probe failures.
 - The transport that answers is cached per `host:port` inside the calling
   `Client` (10 minute TTL, bounded capacity) so later queries skip the failing
   probe. `client.cached_transport()` and `client.clear_transport_cache()`
   expose it.
 - `timeout` is an end-to-end deadline: SRV lookup, DNS, and every probe share
   it instead of restarting it per stage.
-- Direct Java probes try every resolved address (IPv4 first) before failing.
+- Direct Java probes — and every RakNet transport path — try every resolved
+  address (IPv4 first) within the shared deadline before failing.
 - NetherNet HTTPS runs on the game port; a plain `http://` endpoint is only
   tried after a transport-level failure and when the insecure-HTTP policy
   allows it (`allow_insecure_http`, on by default). Receiving any HTTP status
   never triggers the fallback.
 - SRV records are ordered by priority with RFC 2782 weighted-random selection
-  inside each priority class (zero-weight records keep a minimal ticket).
+  inside each priority class; zero-weight records own an empty range and are
+  only ordered once nothing else remains. An explicitly specified port skips
+  SRV entirely.
+- A status response whose JSON cannot be parsed is a protocol failure
+  (`Error::InvalidPacket`), not a blank status; missing optional fields stay
+  lenient.
 
 ## Protocol layer
 
@@ -144,10 +156,13 @@ Zero-copy paths:
 
 - `bedrock::raknet::query_addr_into(address, buffer, timeout)` reads the pong
   into a caller-owned buffer and returns a borrowed `RakNetDetailsRef`;
-  reusing one buffer across polls keeps steady-state allocation at zero.
+  reusing one buffer across polls keeps steady-state explicit allocation at
+  zero (runtime internals such as socket creation aside). The whole exchange
+  — connect, send, receive — shares one deadline.
 - `protocol::bedrock::raknet::decode_pong` and `decode_motd_text` parse into
-  borrowed `Cow` fields; decoding allocates only when the first MOTD line
-  contains semicolons and must be re-joined.
+  borrowed `Cow` fields with no heap allocation at all: a first MOTD line
+  containing semicolons is one contiguous byte span of the input and is
+  borrowed as a whole.
 - `protocol::bedrock::nethernet::parse_join_ref` deserializes the join JSON
   into borrowed `Cow` fields with `#[serde(borrow)]`.
 

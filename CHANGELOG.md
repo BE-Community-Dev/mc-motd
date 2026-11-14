@@ -46,6 +46,19 @@ All notable changes to this project will be documented in this file.
 - Feature matrix: `java`, `bedrock`, `nethernet` (default), `lan` (opt-in) so
   Bedrock-only builds drop Java, SRV, and the DNS resolver dependency, and
   RakNet-only builds drop HTTP/TLS entirely.
+- Contract fixes from review: an explicitly specified port skips SRV entirely;
+  `Status.address` keeps the requested address (including explicit ports)
+  untouched while SRV targets surface through `JavaDetails::srv`; status
+  payloads with unparseable JSON fail with `Error::InvalidPacket` instead of
+  producing a blank status; RakNet and Java SRV probes try every resolved
+  address (IPv4 first) within the shared deadline; aggregate errors chain to
+  the first probe failure through `Error::source()` and cached-transport
+  fallbacks keep both probe failures; `Client::query_with` layers per-query
+  options on top of the client defaults instead of replacing them.
+- RakNet MOTD decoding is fully allocation-free: a first MOTD line containing
+  semicolons is borrowed as one contiguous span instead of being re-joined;
+  Java description parsing flattens nested text components (`extra`,
+  `translate`).
 
 ### Changed
 

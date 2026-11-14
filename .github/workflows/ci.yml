@@ -27,3 +27,27 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
       - run: cargo package --allow-dirty
+
+  features:
+    name: Features (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features --features java"
+          - "--no-default-features --features bedrock"
+          - "--no-default-features --features nethernet"
+          - "--no-default-features --features java,bedrock"
+          - "--no-default-features --features bedrock,lan"
+          - "--all-features"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - run: cargo check --all-targets ${{ matrix.features }}
+      - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
+      - run: cargo test ${{ matrix.features }}

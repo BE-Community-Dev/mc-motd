@@ -61,17 +61,18 @@ pub(crate) async fn probe(
     deadline: Instant,
     parts: &Parts<'_>,
     options: &QueryOptions,
-    resolved: Option<std::net::IpAddr>,
+    ips: &[std::net::IpAddr],
 ) -> Result<Status, Vec<Attempt>> {
     #[cfg(not(feature = "nethernet"))]
-    let _ = options;
-    #[cfg(not(feature = "nethernet"))]
-    return raknet::probe(address, deadline, resolved, parts)
-        .await
-        .map_err(|attempt| vec![attempt]);
+    {
+        let _ = options;
+        return raknet::probe(address, deadline, ips, parts)
+            .await
+            .map_err(|attempt| vec![attempt]);
+    }
 
     #[cfg(feature = "nethernet")]
-    probe_with_nethernet(address, deadline, parts, options, resolved).await
+    probe_with_nethernet(address, deadline, parts, options, ips).await
 }
 
 /// Transport selection with `NetherNet` available.
@@ -81,26 +82,30 @@ async fn probe_with_nethernet(
     deadline: Instant,
     parts: &Parts<'_>,
     options: &QueryOptions,
-    resolved: Option<std::net::IpAddr>,
+    ips: &[std::net::IpAddr],
 ) -> Result<Status, Vec<Attempt>> {
     let host = &address.host;
     let port = address.bedrock_port;
     match parts.cache.cached(host, port) {
         Some(Transport::NetherNetHttp) => {
-            if let Ok(status) = nethernet::probe(address, deadline, parts, options).await {
-                return Ok(status);
+            // Keep both failures when the cached transport and the fallback
+            // both fail, so callers see the full picture.
+            let first = nethernet::probe(address, deadline, parts, options).await;
+            match first {
+                Ok(status) => Ok(status),
+                Err(first_attempt) => raknet::probe(address, deadline, ips, parts)
+                    .await
+                    .map_err(|second_attempt| vec![first_attempt, second_attempt]),
             }
-            raknet::probe(address, deadline, resolved, parts)
-                .await
-                .map_err(|attempt| vec![attempt])
         }
         Some(Transport::RakNetUdp) => {
-            if let Ok(status) = raknet::probe(address, deadline, resolved, parts).await {
-                return Ok(status);
+            let first = raknet::probe(address, deadline, ips, parts).await;
+            match first {
+                Ok(status) => Ok(status),
+                Err(first_attempt) => nethernet::probe(address, deadline, parts, options)
+                    .await
+                    .map_err(|second_attempt| vec![first_attempt, second_attempt]),
             }
-            nethernet::probe(address, deadline, parts, options)
-                .await
-                .map_err(|attempt| vec![attempt])
         }
         _ => {
             let nether_future = async {
@@ -109,7 +114,7 @@ async fn probe_with_nethernet(
                     .map_err(|attempt| vec![attempt])
             };
             let raknet_future = async {
-                raknet::probe(address, deadline, resolved, parts)
+                raknet::probe(address, deadline, ips, parts)
                     .await
                     .map_err(|attempt| vec![attempt])
             };
@@ -125,7 +130,7 @@ pub(crate) async fn run(
     options: &QueryOptions,
     deadline: Instant,
 ) -> Result<Status> {
-    probe(address, deadline, parts, options, None)
+    probe(address, deadline, parts, options, &[])
         .await
         .map_err(|attempts| Error::NoCompatibleBedrockServer {
             host: address.host.clone(),

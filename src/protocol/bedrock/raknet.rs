@@ -117,9 +117,9 @@ pub fn decode_pong(packet: &[u8]) -> Result<RakNetDetailsRef<'_>, Error> {
 
 /// Decode the semicolon-separated Bedrock MOTD text payload.
 ///
-/// The common path is allocation-free: field slices borrow from `text` and no
-/// intermediate list is built. Decoding allocates only when the first MOTD
-/// line contains semicolons and its parts must be re-joined into one string.
+/// Decoding performs no heap allocation: every field slice borrows from
+/// `text`, including a first MOTD line that contains semicolons (its parts
+/// are one contiguous byte span and are borrowed as a whole).
 ///
 /// The parser tolerates short payloads and semicolons in the first MOTD line.
 ///
@@ -144,9 +144,10 @@ pub fn decode_motd_text(text: &str) -> Result<RakNetDetailsRef<'_>, Error> {
         return Err(Error::InvalidPacket("Bedrock MOTD line is missing"));
     }
 
-    let mut fields = body.split(';');
     if field_count < 12 {
-        // Short form: fields map by position and missing tail fields stay unset.
+        // Short form: fields map by position and missing tail fields stay
+        // unset. Sequential iteration keeps this allocation-free.
+        let mut fields = body.split(';');
         let edition = fields.next().unwrap_or_default();
         let motd_line_1 = fields.next().unwrap_or_default();
         let protocol = fields.next().and_then(|value| value.parse::<i32>().ok());
@@ -177,34 +178,37 @@ pub fn decode_motd_text(text: &str) -> Result<RakNetDetailsRef<'_>, Error> {
     }
 
     // Long form: fields 1..tail_start form the first MOTD line, which may
-    // contain semicolons; the last 10 fields are the fixed tail.
+    // contain semicolons; the last 10 fields are the fixed tail. Those middle
+    // fields are one contiguous byte span of `body`, so the first MOTD line
+    // borrows directly instead of being split and re-joined.
     let tail_start = field_count - 10;
-    let edition = fields.next().unwrap_or_default();
-    let motd_line_1: Cow<'_, str> = if tail_start == 2 {
-        Cow::Borrowed(fields.next().unwrap_or_default())
-    } else {
-        let mut joined = String::new();
-        for index in 1..tail_start {
-            if index > 1 {
-                joined.push(';');
-            }
-            joined.push_str(fields.next().unwrap_or_default());
-        }
-        Cow::Owned(joined)
+    let Some(first_semi) = body.find(';') else {
+        return Err(Error::InvalidPacket("Bedrock MOTD line is missing"));
     };
-    let protocol = fields.next().and_then(|value| value.parse::<i32>().ok());
-    let version = fields.next().unwrap_or_default();
-    let players_online = fields.next().and_then(|value| value.parse().ok());
-    let players_max = fields.next().and_then(|value| value.parse().ok());
-    let server_id = fields.next().unwrap_or_default();
-    let motd_line_2 = fields.next().unwrap_or_default();
-    let game_mode = fields.next().unwrap_or_default();
-    let game_mode_numeric = fields.next().and_then(|value| value.parse().ok());
-    let port_ipv4 = fields.next().and_then(|value| value.parse().ok());
-    let port_ipv6 = fields.next().and_then(|value| value.parse().ok());
+    let line_1_end = body
+        .match_indices(';')
+        .nth(tail_start - 1)
+        .map_or(body.len(), |(offset, _)| offset);
+    let tail_text = &body[line_1_end + 1..];
+
+    let edition = Cow::Borrowed(&body[..first_semi]);
+    let motd_line_1 = Cow::Borrowed(&body[first_semi + 1..line_1_end]);
+    let mut tail_fields = tail_text.split(';');
+    let protocol = tail_fields
+        .next()
+        .and_then(|value| value.parse::<i32>().ok());
+    let version = tail_fields.next().unwrap_or_default();
+    let players_online = tail_fields.next().and_then(|value| value.parse().ok());
+    let players_max = tail_fields.next().and_then(|value| value.parse().ok());
+    let server_id = tail_fields.next().unwrap_or_default();
+    let motd_line_2 = tail_fields.next().unwrap_or_default();
+    let game_mode = tail_fields.next().unwrap_or_default();
+    let game_mode_numeric = tail_fields.next().and_then(|value| value.parse().ok());
+    let port_ipv4 = tail_fields.next().and_then(|value| value.parse().ok());
+    let port_ipv6 = tail_fields.next().and_then(|value| value.parse().ok());
 
     Ok(RakNetDetailsRef {
-        edition: Cow::Borrowed(edition),
+        edition,
         motd_line_1,
         protocol,
         version: Cow::Borrowed(version),
@@ -261,6 +265,10 @@ mod tests {
         .expect("motd should parse");
 
         assert_eq!(motd.motd_line_1, "Hello;World");
+        assert!(
+            matches!(motd.motd_line_1, Cow::Borrowed(_)),
+            "the joined line is one contiguous span of the input"
+        );
         assert_eq!(motd.version, "1.21.100");
     }
 

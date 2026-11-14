@@ -152,16 +152,20 @@ impl std::error::Error for Error {
         match self {
             Self::Io(error) => Some(error),
             Self::InvalidUtf8(error) => Some(error),
+            // Aggregate errors chain to the first probe failure so callers
+            // can walk `source()` down to the original I/O or HTTP error.
+            Self::NoCompatibleServer { attempts, .. }
+            | Self::NoCompatibleJavaServer { attempts, .. }
+            | Self::NoCompatibleBedrockServer { attempts, .. } => attempts
+                .first()
+                .map(|attempt| attempt.error.as_ref() as &(dyn std::error::Error + 'static)),
             Self::ResolveFailed
             | Self::Timeout
             | Self::Dns(_)
             | Self::InvalidInput(_)
             | Self::InvalidPacket(_)
             | Self::HttpStatus(_)
-            | Self::Http(_)
-            | Self::NoCompatibleServer { .. }
-            | Self::NoCompatibleJavaServer { .. }
-            | Self::NoCompatibleBedrockServer { .. } => None,
+            | Self::Http(_) => None,
         }
     }
 }
