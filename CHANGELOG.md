@@ -124,7 +124,12 @@ All notable changes to this project will be documented in this file.
     zero-weight records keep their small chance) and shuffles all-zero groups
     instead of always returning the first record; the random source is
     injectable and the distribution tests use fixed seeds, so CI cannot flake
-    on clock entropy
+    on clock entropy; production seeds come from the standard library's
+    OS-entropy hasher plus an atomic counter, so concurrent lookups in the
+    same clock tick no longer share an ordering sequence
+  - Java SRV probes connect to the SRV target but send the caller's requested
+    hostname in the status handshake, matching vanilla Server List Ping and
+    virtual-host proxy routing
 - Contract fixes from review: an explicitly specified port skips SRV entirely;
   `Status.address` keeps the requested address (including explicit ports)
   untouched while SRV targets surface through `JavaDetails::srv`; status

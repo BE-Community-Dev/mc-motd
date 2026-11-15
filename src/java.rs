@@ -170,13 +170,12 @@ pub(crate) async fn lookup_srv(
 /// Order SRV records by priority with RFC 2782 weighted-random selection
 /// inside each priority class.
 ///
-/// The random source is seeded from the system clock. Tests use
+/// The random source is seeded from the standard library's OS-entropy hasher
+/// ([`std::collections::hash_map::RandomState`]); tests use
 /// [`weighted_srv_order_with`] with a fixed seed so distribution assertions are
 /// deterministic.
 fn weighted_srv_order(records: Vec<SrvTarget>) -> Vec<SrvTarget> {
-    let mut seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(1_u64, |duration| u64::from(duration.subsec_nanos()) | 1);
+    let mut seed = random_seed();
     let mut random = move || {
         // xorshift64: tiny dependency-free PRNG, good enough for ordering.
         seed ^= seed << 13;
@@ -185,6 +184,24 @@ fn weighted_srv_order(records: Vec<SrvTarget>) -> Vec<SrvTarget> {
         seed
     };
     weighted_srv_order_with(records, &mut random)
+}
+
+/// Draw a fresh 64-bit seed for the ordering PRNG.
+///
+/// `RandomState` is seeded by the standard library from OS entropy and its
+/// per-call keys differ even within one clock tick, so concurrent lookups do
+/// not share an ordering sequence. The atomic counter adds an independent
+/// input without taking a lock.
+fn random_seed() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    // xorshift must not be seeded with zero.
+    hasher.finish() | 1
 }
 
 /// Order SRV records with a caller-supplied random source.
@@ -374,9 +391,13 @@ pub(crate) async fn probe_srv_sequence(
     }
 }
 
-/// Probe one SRV target, trying every resolved address in order. The
-/// handshake speaks to the target while `Status.address` keeps the requested
-/// address and the SRV record lands in [`JavaDetails::srv`].
+/// Probe one SRV target, trying every resolved address in order.
+///
+/// The TCP connection goes to the SRV target, but the handshake names the host
+/// the caller originally asked for: virtual-host proxies route on that name,
+/// and vanilla Server List Ping sends the pre-SRV hostname. `Status.address`
+/// keeps the requested address and the SRV record lands in
+/// [`JavaDetails::srv`].
 async fn probe_target(
     requested: &ServerAddress,
     target: &SrvTarget,
@@ -398,7 +419,9 @@ async fn probe_target(
         let socket = SocketAddr::new(ip, target.port);
         match query_socket(
             socket,
-            &target.host,
+            // Handshake host = the requested name, not the SRV target; the
+            // handshake port is the port the connection actually uses.
+            &requested.host,
             target.port,
             requested,
             resolved,
@@ -487,10 +510,14 @@ pub(crate) async fn probe_direct(
 }
 
 /// Connect, exchange the status handshake, and build the Java [`Status`].
+///
+/// `handshake_host` and `handshake_port` are what the handshake packet names;
+/// they are not necessarily the address the socket connects to (SRV targets
+/// connect to a different host while naming the requested one).
 async fn query_socket(
     socket: SocketAddr,
-    host: &str,
-    port: u16,
+    handshake_host: &str,
+    handshake_port: u16,
     requested: &ServerAddress,
     resolved: &ResolvedOptions,
     deadline: Instant,
@@ -504,7 +531,7 @@ async fn query_socket(
     .await
     .map_err(|_| Error::Timeout)??;
 
-    let handshake = codec::encode_status_request(host, port, -1);
+    let handshake = codec::encode_status_request(handshake_host, handshake_port, -1);
     time::timeout(
         crate::client::engine::remaining(deadline)?,
         stream.write_all(&handshake),
@@ -660,6 +687,7 @@ mod tests {
     use super::*;
 
     use std::net::Ipv4Addr;
+    use std::sync::{Arc, Mutex};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -985,6 +1013,98 @@ mod tests {
             matches!(&status.details, Details::Java(details) if details.srv.is_none()),
             "the answer must come from the direct fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn srv_handshake_names_the_requested_hostname() {
+        // The connection goes to the SRV target, but the handshake must name
+        // the host the caller asked for: virtual-host proxies route on it.
+        let (target, captured) = spawn_handshake_capture_mock().await;
+        let requested =
+            crate::address::parse_server_address("play.example.com:25565", 25_565, 19_132)
+                .expect("address should parse");
+        let targets = vec![SrvTarget {
+            host: "127.0.0.1".into(),
+            port: target.port(),
+            priority: 0,
+            weight: 0,
+        }];
+        let resolved = ResolvedOptions {
+            edition: None,
+            java_port: requested.java_port,
+            bedrock_port: requested.bedrock_port,
+            timeout: Duration::from_secs(2),
+            try_srv: true,
+            allow_insecure_http: false,
+            max_response_bytes: 64 * 1024,
+            max_java_status_bytes: crate::client::DEFAULT_MAX_JAVA_STATUS_BYTES,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        let status = probe_srv_sequence(&requested, &targets, &resolved, deadline)
+            .await
+            .expect("the SRV target should answer");
+        assert_eq!(status.motd, "Mock");
+
+        let request = captured.lock().expect("capture lock poisoned").clone();
+        let text = String::from_utf8_lossy(&request);
+        assert!(
+            text.contains("play.example.com"),
+            "the handshake must name the requested host: {text:?}"
+        );
+        assert!(
+            !text.contains("127.0.0.1"),
+            "the handshake must not name the SRV target: {text:?}"
+        );
+    }
+
+    #[test]
+    fn srv_ordering_varies_between_calls() {
+        // The production seed must not repeat across calls in the same clock
+        // tick: 32 draws of a four-record all-zero group should not all agree.
+        let mut firsts = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let ordered = weighted_srv_order(vec![
+                srv("a.example.com", 0),
+                srv("b.example.com", 0),
+                srv("c.example.com", 0),
+                srv("d.example.com", 0),
+            ]);
+            firsts.insert(ordered[0].host.clone());
+        }
+        assert!(
+            firsts.len() > 1,
+            "the production SRV seed repeated across calls: {firsts:?}"
+        );
+    }
+
+    /// Spawn a Java status server that records the first request bytes and
+    /// answers with a valid status payload.
+    async fn spawn_handshake_capture_mock() -> (std::net::SocketAddr, Arc<Mutex<Vec<u8>>>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("mock listener should bind");
+        let address = listener.local_addr().expect("mock address should exist");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0_u8; 512];
+            let len = stream.read(&mut request).await.unwrap_or(0);
+            *sink.lock().expect("capture lock poisoned") = request[..len].to_vec();
+
+            let json = r#"{"description":"Mock","players":{"online":1,"max":20},"version":{"name":"1.21.4","protocol":763}}"#;
+            let body = json.as_bytes();
+            let mut packet = vec![0x00];
+            packet.push(u8::try_from(body.len()).expect("length fits in u8"));
+            packet.extend_from_slice(body);
+            let mut frame = vec![u8::try_from(packet.len()).expect("length fits in u8")];
+            frame.extend_from_slice(&packet);
+            let _ = stream.write_all(&frame).await;
+        });
+        (address, captured)
     }
 
     /// Spawn a Java status server that answers every connection with a valid
