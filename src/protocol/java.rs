@@ -49,6 +49,18 @@ pub fn encode_status_request(host: &str, port: u16, protocol_version: i32) -> Ve
 /// is truncated or too long, the JSON length is invalid, or the JSON bytes are
 /// not valid UTF-8.
 pub fn parse_status_response(packet: &[u8]) -> Result<&str, Error> {
+    parse_status_response_parts(packet).map(|(_, json)| json)
+}
+
+/// Byte offset of the JSON payload inside a status response packet.
+///
+/// Callers that own the packet buffer can strip the packet-id and length
+/// prefix in place instead of copying the JSON into a second buffer.
+pub(crate) fn status_response_json_offset(packet: &[u8]) -> Result<usize, Error> {
+    parse_status_response_parts(packet).map(|(offset, _)| offset)
+}
+
+fn parse_status_response_parts(packet: &[u8]) -> Result<(usize, &str), Error> {
     let mut cursor = 0;
     let packet_id = read_varint_from_slice(packet, &mut cursor)?;
     if packet_id != STATUS_REQUEST_PACKET_ID {
@@ -69,7 +81,8 @@ pub fn parse_status_response(packet: &[u8]) -> Result<&str, Error> {
         ));
     }
 
-    std::str::from_utf8(&packet[cursor..json_end]).map_err(Error::from)
+    let json = std::str::from_utf8(&packet[cursor..json_end]).map_err(Error::from)?;
+    Ok((cursor, json))
 }
 
 /// Read one `VarInt` from the stream while it stays readable.

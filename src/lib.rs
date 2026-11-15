@@ -67,8 +67,8 @@ pub use address::{
     ServerAddress, normalize_server_host, parse_server_address, validate_port, validate_server_host,
 };
 pub use client::{
-    Client, DEFAULT_BEDROCK_PORT, DEFAULT_CACHE_CAPACITY, DEFAULT_JAVA_PORT, DEFAULT_TIMEOUT,
-    QueryOptions,
+    Client, ClientBuilder, DEFAULT_BEDROCK_PORT, DEFAULT_CACHE_CAPACITY, DEFAULT_JAVA_PORT,
+    DEFAULT_TIMEOUT, QueryOptions,
 };
 pub use error::{Error, Result};
 #[cfg(feature = "java")]

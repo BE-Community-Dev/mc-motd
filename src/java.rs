@@ -6,6 +6,7 @@
 //! protocol codec lives in [`crate::protocol::java`].
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -568,7 +569,13 @@ async fn query_socket(
         return Err(Error::InvalidPacket("Java status packet is truncated"));
     }
 
-    let raw_json = codec::parse_status_response(&packet)?.to_owned();
+    // Strip the packet-id and length prefix in place, then take ownership of
+    // the same buffer as the raw JSON: the payload is never copied into a
+    // second allocation.
+    let json_offset = codec::status_response_json_offset(&packet)?;
+    packet.drain(..json_offset);
+    let raw_json =
+        String::from_utf8(packet).map_err(|error| Error::InvalidUtf8(error.utf8_error()))?;
     // A well-formed status packet carrying garbage is a protocol failure, not
     // a blank server: without this check automatic probing would stop at a
     // broken Java response. One typed parse validates the structure and
@@ -598,7 +605,9 @@ async fn query_socket(
         },
         elapsed: Duration::ZERO,
         details: Details::Java(JavaDetails {
-            raw_json,
+            // Shared so every singleflight waiter can clone the status
+            // without copying the payload.
+            raw_json: Arc::new(raw_json),
             srv: None,
         }),
     })
@@ -971,6 +980,26 @@ mod tests {
         assert_eq!(status.motd, "Mock");
         assert_eq!(status.players.online, Some(1));
         assert_eq!(status.version.protocol, Some(763));
+    }
+
+    #[tokio::test]
+    async fn cloning_a_java_status_shares_the_raw_json() {
+        let address = spawn_status_server().await;
+        let status = query(format!("127.0.0.1:{}", address.port()))
+            .await
+            .expect("mock java server should answer");
+        let clone = status.clone();
+
+        #[allow(irrefutable_let_patterns)]
+        let (Details::Java(original), Details::Java(copied)) = (&status.details, &clone.details)
+        else {
+            unreachable!("this build only has Java details");
+        };
+        assert!(
+            Arc::ptr_eq(&original.raw_json, &copied.raw_json),
+            "cloning a status must share the raw JSON, not copy it"
+        );
+        assert!(original.raw_json.as_str().contains("\"Mock\""));
     }
 
     #[tokio::test]

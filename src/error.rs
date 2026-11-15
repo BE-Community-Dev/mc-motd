@@ -34,6 +34,12 @@ pub enum Error {
     HttpStatus(u16),
     /// An HTTP request failed before or during the exchange.
     Http(String),
+    /// The client's pending-query limit is saturated.
+    ///
+    /// Raised when [`crate::ClientBuilder::max_pending_keys`] is set and a
+    /// query for a *new* address cannot be registered. Callers may retry
+    /// later, raise the limit, or bound their own task count.
+    QueueFull,
     /// A primary transport attempt and its scheme fallback both failed.
     ///
     /// Keeping both failures means a TLS error cannot hide the fallback's more
@@ -104,6 +110,7 @@ impl Clone for Error {
             Self::InvalidUtf8(error) => Self::InvalidUtf8(*error),
             Self::HttpStatus(status) => Self::HttpStatus(*status),
             Self::Http(message) => Self::Http(message.clone()),
+            Self::QueueFull => Self::QueueFull,
             Self::Fallback { primary, fallback } => Self::Fallback {
                 primary: primary.clone(),
                 fallback: fallback.clone(),
@@ -167,6 +174,7 @@ impl fmt::Display for Error {
                 write!(formatter, "server returned HTTP status {status}")
             }
             Self::Http(error) => write!(formatter, "HTTP request failed: {error}"),
+            Self::QueueFull => formatter.write_str("client pending query limit reached"),
             Self::Fallback { primary, fallback } => {
                 write!(
                     formatter,
@@ -246,7 +254,8 @@ impl std::error::Error for Error {
             | Self::InvalidInput(_)
             | Self::InvalidPacket(_)
             | Self::HttpStatus(_)
-            | Self::Http(_) => None,
+            | Self::Http(_)
+            | Self::QueueFull => None,
         }
     }
 }

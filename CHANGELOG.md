@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
   - a reusable, cheap-to-clone `Client` with a builder (timeout, cache capacity,
     insecure-HTTP policy) and `query_with` + chainable `QueryOptions`;
   - a pure `protocol` module for encode/decode with zero-copy paths.
+  `ClientBuilder` is re-exported at the crate root so the builder type can be
+  named.
 - Unified `Status` result model (`address`, normalized `motd`, `players`,
   `version`, end-to-end `elapsed`, protocol `details`) shared by Java, `RakNet`,
   and `NetherNet`; edition and transport are derived from `details`.
@@ -23,7 +25,8 @@ All notable changes to this project will be documented in this file.
   entries preserving the original error chain, plus
   `NoCompatibleServer` / `NoCompatibleJavaServer` / `NoCompatibleBedrockServer`.
   `Error::Fallback { primary, fallback }` keeps both failures when a transport
-  attempt and its scheme fallback fail.
+  attempt and its scheme fallback fail, and `Error::QueueFull` reports a
+  saturated `max_pending_keys` limit.
 - Concurrent automatic probing: Java and Bedrock probes are polled in parallel
   with a single shared DNS resolution, the first compatible response wins, and
   inside the Bedrock race the faster transport wins (`NetherNet` preferred on
@@ -130,6 +133,14 @@ All notable changes to this project will be documented in this file.
   - Java SRV probes connect to the SRV target but send the caller's requested
     hostname in the status handshake, matching vanilla Server List Ping and
     virtual-host proxy routing
+  - Java status payloads are taken over from the read buffer in place (prefix
+    stripped with `Vec::drain`, `String::from_utf8` without a copy) and stored
+    as `Arc<String>`, so cloning a `Status` for every singleflight waiter no
+    longer copies the raw JSON; **breaking:** `JavaDetails::raw_json` changed
+    from `String` to `Arc<String>`
+  - `max_pending_keys(n)` bounds the number of distinct keys with a live
+    merged flight; same-key callers still join, while a new key over the limit
+    fails fast with the new `Error::QueueFull` instead of growing the map
 - Contract fixes from review: an explicitly specified port skips SRV entirely;
   `Status.address` keeps the requested address (including explicit ports)
   untouched while SRV targets surface through `JavaDetails::srv`; status

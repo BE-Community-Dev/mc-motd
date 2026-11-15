@@ -227,6 +227,9 @@ struct ClientInner {
     /// is held from flight creation until its shared probe finishes, so a
     /// scan of many targets cannot accumulate unbounded detached tasks.
     queued: Arc<tokio::sync::Semaphore>,
+    /// Bounds the number of distinct keys with a live flight (pending or
+    /// admitted). A key over the limit is rejected instead of growing the map.
+    pending_keys: Arc<tokio::sync::Semaphore>,
     /// Merges concurrent identical queries into one shared probe when
     /// `merge_in_flight` was enabled on the builder.
     flights: Arc<Mutex<HashMap<String, Arc<Flight>>>>,
@@ -482,6 +485,7 @@ pub struct ClientBuilder {
     merge_in_flight: bool,
     max_in_flight: Option<usize>,
     max_queued: Option<usize>,
+    max_pending_keys: Option<usize>,
 }
 
 #[allow(clippy::derivable_impls)] // not derivable when the bedrock feature adds cache_capacity
@@ -494,6 +498,7 @@ impl Default for ClientBuilder {
             merge_in_flight: false,
             max_in_flight: None,
             max_queued: None,
+            max_pending_keys: None,
         }
     }
 }
@@ -623,12 +628,10 @@ impl ClientBuilder {
     ///
     /// Callers for the same key share one pending flight while it waits for a
     /// slot, so a saturated queue does not break merging: the first caller
-    /// owns the pending flight and the rest wait on its outcome. Flights that
-    /// have not been admitted yet are lightweight map entries created by, and
-    /// removed with, their owning caller task; their number is therefore
-    /// bounded by the caller's live tasks, and a separate pending-key limit
-    /// would duplicate caller-side backpressure while breaking same-key
-    /// merging whenever that limit is saturated.
+    /// owns the pending flight and the rest wait on its outcome.
+    ///
+    /// Use [`ClientBuilder::max_pending_keys`] for a hard bound on the number
+    /// of distinct keys with a live flight.
     ///
     /// This is separate from [`ClientBuilder::max_in_flight`]: the queue bound
     /// limits how many probes may exist, the in-flight bound limits how many
@@ -647,14 +650,41 @@ impl ClientBuilder {
         self
     }
 
+    /// Bound the number of distinct keys with a live merged flight.
+    ///
+    /// Only used when [`ClientBuilder::merge_in_flight`] is enabled. A key
+    /// holds one slot from the moment its pending flight is registered until
+    /// that flight is removed. Callers for an *existing* key join it without a
+    /// slot, so same-key merging still works at the limit.
+    ///
+    /// A query for a *new* key while every slot is taken fails immediately
+    /// with [`crate::error::Error::QueueFull`] instead of growing the map; the
+    /// caller can retry, raise the limit, or bound its own task count. This is
+    /// the explicit backpressure counterpart to [`ClientBuilder::max_queued`],
+    /// which only bounds admitted probes.
+    ///
+    /// `None` (the default) leaves the number of pending keys unbounded; in
+    /// practice it is then bounded by the caller's live tasks.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientBuilder::build`] rejects `0` and values above
+    /// [`tokio::sync::Semaphore::MAX_PERMITS`].
+    #[must_use]
+    pub fn max_pending_keys(mut self, max_pending_keys: usize) -> Self {
+        self.max_pending_keys = Some(max_pending_keys);
+        self
+    }
+
     /// Build the client.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::Error::InvalidInput`] when `max_in_flight` or
-    /// `max_queued` is zero or exceeds [`tokio::sync::Semaphore::MAX_PERMITS`],
-    /// and [`crate::error::Error::Http`] when the `NetherNet` HTTP client
-    /// cannot be constructed, instead of silently substituting a differently
+    /// Returns [`crate::error::Error::InvalidInput`] when `max_in_flight`,
+    /// `max_queued`, or `max_pending_keys` is zero or exceeds
+    /// [`tokio::sync::Semaphore::MAX_PERMITS`], and
+    /// [`crate::error::Error::Http`] when the `NetherNet` HTTP client cannot
+    /// be constructed, instead of silently substituting a differently
     /// configured client.
     pub fn build(self) -> std::result::Result<Client, crate::error::Error> {
         if let Some(limit) = self.max_in_flight {
@@ -679,6 +709,18 @@ impl ClientBuilder {
                 ));
             }
         }
+        if let Some(limit) = self.max_pending_keys {
+            if limit == 0 {
+                return Err(Error::InvalidInput(
+                    "max_pending_keys must be greater than zero",
+                ));
+            }
+            if limit > tokio::sync::Semaphore::MAX_PERMITS {
+                return Err(Error::InvalidInput(
+                    "max_pending_keys exceeds the semaphore limit",
+                ));
+            }
+        }
         #[cfg(feature = "nethernet")]
         let http = crate::bedrock::nethernet::build_http_client()?;
         #[allow(clippy::let_unit_value)]
@@ -697,6 +739,10 @@ impl ClientBuilder {
                 )),
                 queued: Arc::new(tokio::sync::Semaphore::new(
                     self.max_queued
+                        .unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
+                )),
+                pending_keys: Arc::new(tokio::sync::Semaphore::new(
+                    self.max_pending_keys
                         .unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
                 )),
                 flights: Arc::new(Mutex::new(HashMap::new())),
@@ -911,20 +957,27 @@ impl Client {
     /// panic during admission removes the placeholder. Waiters are told the
     /// flight was abandoned rather than inheriting this caller's failure.
     async fn admit(&self, key: &str, deadline: Instant) -> Result<Admission, Error> {
-        let entry = {
+        let (entry, pending_permit) = {
             let mut flights = self.inner.flights.lock().expect("flights lock poisoned");
             if let Some(existing) = flights.get(key) {
                 return Ok(Admission::Joined(Arc::clone(existing)));
             }
+            // Non-blocking, so the map check and the registration are atomic:
+            // two callers cannot both create the same key, and an existing
+            // key never needs a new slot.
+            let permit = Arc::clone(&self.inner.pending_keys)
+                .try_acquire_owned()
+                .map_err(|_| Error::QueueFull)?;
             let entry = Arc::new(Flight::new());
             flights.insert(key.to_string(), Arc::clone(&entry));
-            entry
+            (entry, permit)
         };
 
         let mut guard = FlightGuard::new(
             Arc::clone(&self.inner.flights),
             key.to_string(),
             Arc::clone(&entry),
+            Some(pending_permit),
         );
         let permit = match acquire_queue_slot(&self.inner.queued, deadline).await {
             Ok(permit) => permit,
@@ -981,6 +1034,8 @@ struct FlightGuard {
     entry: Arc<Flight>,
     admitted: bool,
     armed: bool,
+    /// Holds the `max_pending_keys` slot until the flight is removed.
+    _pending_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl FlightGuard {
@@ -988,6 +1043,7 @@ impl FlightGuard {
         flights: Arc<Mutex<HashMap<String, Arc<Flight>>>>,
         key: String,
         entry: Arc<Flight>,
+        pending_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Self {
         Self {
             flights,
@@ -995,6 +1051,7 @@ impl FlightGuard {
             entry,
             admitted: false,
             armed: true,
+            _pending_permit: pending_permit,
         }
     }
 
@@ -2484,6 +2541,104 @@ mod concurrency_tests {
         assert!(matches!(error, Error::InvalidInput(_)));
     }
 
+    #[tokio::test]
+    async fn max_pending_keys_rejects_new_keys_but_keeps_merging() {
+        // A holds the only pending-key slot. A second caller for the same key
+        // still joins it, while a different key is rejected immediately
+        // instead of growing the map.
+        let mock = spawn_mock(MOCK_MOTD_TEXT, Duration::from_millis(200), true).await;
+        let address = format!("{}:{}", mock.address.ip(), mock.address.port());
+        let client = Client::builder()
+            .merge_in_flight(true)
+            .max_pending_keys(1)
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("test client should build");
+
+        let holder = {
+            let client = client.clone();
+            let address = address.clone();
+            tokio::spawn(async move {
+                client
+                    .query_with(address, QueryOptions::default().edition(Edition::Bedrock))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let joiner = {
+            let client = client.clone();
+            let address = address.clone();
+            tokio::spawn(async move {
+                client
+                    .query_with(address, QueryOptions::default().edition(Edition::Bedrock))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let rejected = client
+            .query_with(
+                address.clone(),
+                QueryOptions::default()
+                    .edition(Edition::Bedrock)
+                    .max_response_bytes(4096),
+            )
+            .await;
+        assert!(
+            matches!(rejected, Err(Error::QueueFull)),
+            "a new key over the pending limit must be rejected, got {rejected:?}"
+        );
+
+        holder
+            .await
+            .expect("holder task should finish")
+            .expect("holder query should answer");
+        joiner
+            .await
+            .expect("joiner task should finish")
+            .expect("same-key joiner should answer");
+
+        // The slot is released when the flight is removed; retry briefly to
+        // avoid racing the detached task's teardown.
+        let mut accepted = None;
+        for _ in 0..100 {
+            match client
+                .query_with(
+                    address.clone(),
+                    QueryOptions::default()
+                        .edition(Edition::Bedrock)
+                        .max_response_bytes(4096),
+                )
+                .await
+            {
+                Ok(status) => {
+                    accepted = Some(status);
+                    break;
+                }
+                Err(Error::QueueFull) => tokio::time::sleep(Duration::from_millis(2)).await,
+                Err(other) => panic!("unexpected query error: {other:?}"),
+            }
+        }
+        assert_eq!(
+            accepted
+                .expect("a freed pending slot should accept the new key")
+                .motd,
+            "RakNet Mock"
+        );
+    }
+
+    #[test]
+    fn max_pending_keys_rejects_zero() {
+        let error = Client::builder()
+            .max_pending_keys(0)
+            .build()
+            .err()
+            .expect("zero must be rejected");
+
+        assert!(matches!(error, Error::InvalidInput(_)));
+    }
+
     #[test]
     fn panicking_shared_task_cleans_up_its_flight() {
         // The guard is what protects the map when the detached probe task
@@ -2500,7 +2655,7 @@ mod concurrency_tests {
             let flights = Arc::clone(&flights);
             let entry = Arc::clone(&entry);
             move || {
-                let _guard = FlightGuard::new(flights, "panic-key".to_string(), entry);
+                let _guard = FlightGuard::new(flights, "panic-key".to_string(), entry, None);
                 panic!("simulated shared-probe panic");
             }
         }));
@@ -2533,7 +2688,7 @@ mod concurrency_tests {
             let flights = Arc::clone(&flights);
             let entry = Arc::clone(&entry);
             move || {
-                let mut guard = FlightGuard::new(flights, "admitted-key".to_string(), entry);
+                let mut guard = FlightGuard::new(flights, "admitted-key".to_string(), entry, None);
                 guard.mark_admitted();
                 panic!("simulated admitted-probe panic");
             }

@@ -6,6 +6,8 @@
 //! advanced users. Edition and transport are derived from `details`, so there
 //! is never a second stored copy to drift out of sync.
 
+#[cfg(feature = "java")]
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::address::ServerAddress;
@@ -123,7 +125,11 @@ impl Details {
 #[non_exhaustive]
 pub struct JavaDetails {
     /// Raw JSON returned by the server status endpoint.
-    pub raw_json: String,
+    ///
+    /// Shared behind an [`Arc`] so cloning a [`Status`] — for example for
+    /// every singleflight waiter — does not copy the payload. Read it with
+    /// `as_str()` or through `Deref`.
+    pub raw_json: Arc<String>,
     /// SRV record the query was resolved through, if any.
     pub srv: Option<crate::java::SrvTarget>,
 }
